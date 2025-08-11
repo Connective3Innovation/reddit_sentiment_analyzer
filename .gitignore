@@ -1,0 +1,17 @@
+# Virtual env
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Env vars
+.env
+
+# Data
+/data/
+*.parquet
+
+# IDEs
+.vscode/
+.idea/

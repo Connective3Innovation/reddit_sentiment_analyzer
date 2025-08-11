@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reddit-sentiment"
+version = "0.1.0"
+description = "Keyword‑based Reddit post & comment sentiment ETL"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Your Name", email = "you@example.com" }
+]
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.scripts]
+reddit-sentiment = "reddit_sentiment.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["reddit_sentiment"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+strict = true
