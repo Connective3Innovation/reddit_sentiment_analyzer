@@ -1,46 +1,46 @@
-"""App configuration powered by *pydantic‑settings* (built‑in from pydantic v2)."""
-from __future__ import annotations
-
-import logging
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Literal
 from functools import lru_cache
 from pathlib import Path
-from typing import Final
-
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
+import logging
 
 class Settings(BaseSettings):
-    # ────────────────────── Reddit
-    reddit_client_id: str
-    reddit_client_secret: str
-    reddit_user_agent: str = "reddit‑sentiment‑etl (by u/yourname)"
+    # Map directly to REDDIT_CLIENT_ID etc.
+    reddit_client_id: str = Field(validation_alias="REDDIT_CLIENT_ID")
+    reddit_client_secret: str = Field(validation_alias="REDDIT_CLIENT_SECRET")
+    reddit_user_agent: str = Field(validation_alias="REDDIT_USER_AGENT")
 
-    # ────────────────────── Search params
-    max_posts: int = 500
-    days_back: int = 7
-    cache_backend: str = "local"          # "local" or "gcs"
-    cache_max_age_hours: int = 24         # 0 = always accept cache if present
-    gcs_cache_prefix: str | None = None   # e.g. "gs://my-bucket/reddit-cache"
-    gcp_project: str | None = None 
-    # ────────────────────── Sentiment
-    sentiment_engine: str = "vader"  # or "hf"
+    max_posts: int = Field(500, validation_alias="REDDIT_MAX_POSTS")
+    days_back: int = Field(90, validation_alias="REDDIT_DAYS_BACK")
+    sentiment_engine: Literal["hf", "vader"] = Field(
+        "hf", validation_alias="REDDIT_SENTIMENT_ENGINE"
+    )
+    output_dir: str = Field("data", validation_alias="REDDIT_OUTPUT_DIR")
 
-    # ────────────────────── Output
-    output_dir: Path = Path("data")
-
-    # pydantic meta
-    model_config: SettingsConfigDict = SettingsConfigDict(
-        env_prefix="REDDIT_", env_file=".env", case_sensitive=False
+    cache_backend: Literal["local", "gcs"] = Field(
+        "gcs", validation_alias="REDDIT_CACHE_BACKEND"
+    )
+    gcs_cache_prefix: str | None = Field(
+        default=None, validation_alias="REDDIT_GCS_CACHE_PREFIX"
+    )
+    gcp_project: str | None = Field(
+        default=None, validation_alias="REDDIT_GCP_PROJECT"
+    )
+    cache_max_age_hours: int = Field(
+        0, validation_alias="REDDIT_CACHE_MAX_AGE_HOURS"
     )
 
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
-_SETTINGS_LOGGER: Final = logging.getLogger(__name__)
-
+_SETTINGS_LOGGER = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return a singleton validated settings object."""
-    config = Settings()  # reads env / .env
-    _SETTINGS_LOGGER.info("Loaded settings: %s", config.model_dump(exclude={"reddit_client_secret"}))
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    return config
+    cfg = Settings()
+    safe = cfg.model_dump()
+    safe["reddit_client_secret"] = "***"
+    _SETTINGS_LOGGER.info("Loaded settings: %s", safe)
+    if not str(cfg.output_dir).startswith("gs://"):
+        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    return cfg
