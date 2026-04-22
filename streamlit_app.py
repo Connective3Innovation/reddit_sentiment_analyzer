@@ -22,8 +22,8 @@ load_dotenv()
 try:
     import streamlit as _st_secrets
     if hasattr(_st_secrets, 'secrets'):
-        for key in ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'OPENROUTER_API_KEY',
-                    'REDDIT_GCP_PROJECT', 'GCP_SERVICE_ACCOUNT']:
+        for key in ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'REDDIT_USER_AGENT',
+                    'OPENROUTER_API_KEY', 'REDDIT_GCP_PROJECT', 'GCP_SERVICE_ACCOUNT']:
             if key in _st_secrets.secrets and not os.getenv(key):
                 os.environ[key] = str(_st_secrets.secrets[key])
 except Exception:
