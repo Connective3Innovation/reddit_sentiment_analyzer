@@ -330,6 +330,14 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
     from reddit_sentiment.analytics.competitor_analyzer import CompetitorAnalyzer
     from reddit_sentiment.analytics.opportunity_scorer import OpportunityScorer
 
+    # Clear Reddit client cache to pick up any new credentials
+    try:
+        from reddit_sentiment.auth.reddit_auth import clear_client_cache
+        clear_client_cache()
+        st.info("Reddit client cache cleared - using fresh credentials")
+    except ImportError:
+        pass  # Old version without cache clear function
+
     progress = st.progress(0, text="Starting analysis...")
 
     # Step 1: Collect data
@@ -1926,7 +1934,33 @@ if st.session_state.running:
             st.session_state.running = False
             st.rerun()
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
+            import traceback
+            error_msg = str(e)
+            st.error(f"Analysis failed: {error_msg}")
+
+            # Show detailed error for debugging
+            with st.expander("🔍 Error Details (click to expand)", expanded=True):
+                st.code(traceback.format_exc())
+
+                # Check for common Reddit authentication issues
+                if "401" in error_msg or "authentication" in error_msg.lower():
+                    st.warning("""
+                    **Reddit Authentication Error - Common Causes:**
+
+                    1. **Wrong app type**: Your Reddit app at reddit.com/prefs/apps must be type "script" (not "web app" or "installed app")
+
+                    2. **2FA enabled**: If you have two-factor authentication on your Reddit account, you need to use an app password or disable 2FA
+
+                    3. **Wrong credentials**: Double-check username/password in Streamlit secrets
+
+                    4. **IP blocked**: Some cloud providers are blocked by Reddit. The username/password auth helps bypass this.
+
+                    **To fix:**
+                    - Go to reddit.com/prefs/apps
+                    - Delete the current app and create a new one with type "script"
+                    - Update REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in Streamlit secrets
+                    """)
+
             st.session_state.running = False
 
 elif st.session_state.snapshot:
@@ -2042,8 +2076,11 @@ else:
         # Debug: show masked credential values
         st.markdown("---")
         st.markdown("**Debug - Credential Preview (masked):**")
-        for var in ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"]:
+        for var in ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT",
+                    "REDDIT_USERNAME", "REDDIT_PASSWORD"]:
             val = os.getenv(var, "")
             if val:
                 masked = val[:4] + "..." + val[-4:] if len(val) > 8 else "****"
                 st.code(f"{var}: {masked} (len={len(val)})")
+            else:
+                st.code(f"{var}: NOT SET")
