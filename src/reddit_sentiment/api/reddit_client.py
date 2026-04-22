@@ -122,13 +122,20 @@ class RedditClient:
                     if created_utc is not None
                     else None
                 )
+                # Get author name (handle deleted authors)
+                author = getattr(c, "author", None)
+                author_name = str(author) if author else "[deleted]"
+
                 comment_rows.append(
                     {
                         "post_id": s.id,
                         "comment_id": c.id,
                         "body": getattr(c, "body", ""),
                         "created": created_ts,
+                        "created_utc": created_ts,  # Also add created_utc for consistency
                         "score": getattr(c, "score", 0),
+                        "author": author_name,
+                        "subreddit": str(s.subreddit.display_name),  # Inherit from post
                     }
                 )
         return pd.DataFrame(post_rows), pd.DataFrame(comment_rows)

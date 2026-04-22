@@ -27,6 +27,7 @@ from fastapi.responses import (
     RedirectResponse,
 )
 from starlette.middleware.gzip import GZipMiddleware
+from functools import lru_cache
 
 # Optional: faster JSON as default response class (endpoints still use JSONResponse for safety)
 try:
@@ -360,6 +361,26 @@ app.add_middleware(
 # Then GZip once
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+# get the class your import resolver exposes
+HFClass = MODS.get("HfEngine")
+
+@lru_cache(maxsize=1)
+def _warm_hf():
+    if HFClass is None:
+        return
+    try:
+        eng = HFClass()
+        # tiny warmup to build the pipeline & JIT kernels
+        _ = eng.run(["warmup"])
+    except Exception as e:
+        # don't break startup if HF isn't used
+        print(f"HF warmup skipped: {e}")
+
+@app.on_event("startup")
+def _startup():
+    if os.getenv("WARM_HF", "1") == "1":
+        _warm_hf()
+
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse("/docs")
@@ -449,3 +470,132 @@ def debug_env():
         "REDDIT_MORE_LIMIT", "REDDIT_COMMENTS_PER_POST", "REDDIT_SKIP_LARGE_POSTS",
     ]
     return {k: bool(os.getenv(k)) for k in keys}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics Module Loader (for scheduler endpoints)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_analytics_modules():
+    """Import analytics modules with fallback."""
+    mods = {}
+    try:
+        from reddit_sentiment.scheduler.scheduler import get_scheduler
+        mods["get_scheduler"] = get_scheduler
+    except ImportError as e:
+        print(f"Scheduler module not available: {e}")
+    return mods
+
+
+ANALYTICS = _get_analytics_modules()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/scheduler/run")
+def run_scheduled_jobs():
+    """
+    Trigger scheduled jobs.
+
+    Called by Cloud Scheduler or cron.
+    """
+    if "get_scheduler" not in ANALYTICS:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Scheduler module not available"}
+        )
+
+    try:
+        from reddit_sentiment.scheduler.runner import run_all_due
+        summary = run_all_due()
+        return JSONResponse(content=jsonable_encoder(summary))
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/scheduler/status")
+def get_scheduler_status():
+    """View tracked keywords and next run times."""
+    if "get_scheduler" not in ANALYTICS:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Scheduler module not available"}
+        )
+
+    try:
+        scheduler = ANALYTICS["get_scheduler"]()
+        status = scheduler.get_status()
+        return JSONResponse(content=jsonable_encoder(status))
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/scheduler/track")
+def add_tracked_keyword(
+    keyword: str = Query(..., min_length=1),
+    schedule: str = Query("0 6 * * *", description="Cron expression"),
+    days_back: int = Query(1, ge=1, le=30),
+    limit: int = Query(1000, ge=100, le=5000),
+    engine: str = Query("vader", pattern="^(vader|hf)$"),
+):
+    """Add a keyword to tracking."""
+    if "get_scheduler" not in ANALYTICS:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Scheduler module not available"}
+        )
+
+    try:
+        scheduler = ANALYTICS["get_scheduler"]()
+        tracked = scheduler.add_keyword(
+            keyword=keyword,
+            schedule=schedule,
+            days_back=days_back,
+            limit=limit,
+            engine=engine,
+        )
+        return JSONResponse(content=jsonable_encoder({
+            "keyword": tracked.keyword,
+            "schedule": tracked.schedule,
+            "next_run": tracked.next_run.isoformat() if tracked.next_run else None,
+            "config": tracked.config,
+        }))
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.delete("/scheduler/track")
+def remove_tracked_keyword(
+    keyword: str = Query(..., min_length=1),
+):
+    """Remove a keyword from tracking."""
+    if "get_scheduler" not in ANALYTICS:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Scheduler module not available"}
+        )
+
+    try:
+        scheduler = ANALYTICS["get_scheduler"]()
+        scheduler.remove_keyword(keyword)
+        return JSONResponse(content={"status": "removed", "keyword": keyword})
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+# Note: BQ-read endpoints removed. Frontend queries BigQuery directly.
+# Competitive intelligence data is stored via run_analysis.py --save
