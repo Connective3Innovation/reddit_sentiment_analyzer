@@ -1823,6 +1823,19 @@ with st.sidebar:
         client_options = {c.client_id: c for c in clients}
     except Exception:
         client_options = {}
+        # Define a simple ClientConfig class for manual configuration
+        from dataclasses import dataclass, field
+        from typing import List
+
+        @dataclass
+        class ClientConfig:
+            client_id: str
+            client_name: str
+            primary_brand: str
+            search_keywords: List[str] = field(default_factory=list)
+            competitors: List[str] = field(default_factory=list)
+            industry: str = "other"
+            enabled: bool = True
 
     if client_options:
         selected_client = st.selectbox(
