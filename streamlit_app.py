@@ -25,7 +25,9 @@ try:
         for key in ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'REDDIT_USER_AGENT',
                     'OPENROUTER_API_KEY', 'REDDIT_GCP_PROJECT', 'GCP_SERVICE_ACCOUNT']:
             if key in _st_secrets.secrets and not os.getenv(key):
-                os.environ[key] = str(_st_secrets.secrets[key])
+                # Strip whitespace and quotes that might be in TOML values
+                value = str(_st_secrets.secrets[key]).strip().strip('"').strip("'")
+                os.environ[key] = value
 except Exception:
     pass  # Running locally without secrets
 
@@ -2035,3 +2037,12 @@ else:
                     st.success(f"✅ {var}")
                 else:
                     st.warning(f"⚠️ {var} not set")
+
+        # Debug: show masked credential values
+        st.markdown("---")
+        st.markdown("**Debug - Credential Preview (masked):**")
+        for var in ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"]:
+            val = os.getenv(var, "")
+            if val:
+                masked = val[:4] + "..." + val[-4:] if len(val) > 8 else "****"
+                st.code(f"{var}: {masked} (len={len(val)})")
