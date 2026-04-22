@@ -23,6 +23,7 @@ try:
     import streamlit as _st_secrets
     if hasattr(_st_secrets, 'secrets'):
         for key in ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'REDDIT_USER_AGENT',
+                    'REDDIT_USERNAME', 'REDDIT_PASSWORD',
                     'OPENROUTER_API_KEY', 'REDDIT_GCP_PROJECT', 'GCP_SERVICE_ACCOUNT']:
             if key in _st_secrets.secrets and not os.getenv(key):
                 # Strip whitespace and quotes that might be in TOML values

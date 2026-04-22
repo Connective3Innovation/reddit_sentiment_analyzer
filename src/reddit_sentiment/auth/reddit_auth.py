@@ -26,12 +26,24 @@ def get_client() -> praw.Reddit:
     if missing:
         raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
-    client = praw.Reddit(
-        client_id=os.environ["REDDIT_CLIENT_ID"],
-        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-        user_agent=os.environ["REDDIT_USER_AGENT"],
-        ratelimit_seconds=60,  # emergency sleep if throttled
-    )
+    # Use full authentication if username/password provided (needed for cloud environments)
+    # Otherwise fall back to read-only mode
+    reddit_kwargs = {
+        "client_id": os.environ["REDDIT_CLIENT_ID"],
+        "client_secret": os.environ["REDDIT_CLIENT_SECRET"],
+        "user_agent": os.environ["REDDIT_USER_AGENT"],
+        "ratelimit_seconds": 60,  # emergency sleep if throttled
+    }
+
+    # Add username/password if available (helps bypass cloud IP restrictions)
+    if os.environ.get("REDDIT_USERNAME") and os.environ.get("REDDIT_PASSWORD"):
+        reddit_kwargs["username"] = os.environ["REDDIT_USERNAME"]
+        reddit_kwargs["password"] = os.environ["REDDIT_PASSWORD"]
+        _LOGGER.info("Using authenticated mode with username/password")
+    else:
+        _LOGGER.info("Using read-only mode (no username/password)")
+
+    client = praw.Reddit(**reddit_kwargs)
 
     if client.read_only is False:  # pragma: no cover
         _LOGGER.warning("Client has mutation scopes — consider read‑only keys for production.")
