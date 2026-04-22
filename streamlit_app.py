@@ -2022,6 +2022,7 @@ else:
         env_vars = {
             "REDDIT_CLIENT_ID": bool(os.getenv("REDDIT_CLIENT_ID")),
             "REDDIT_CLIENT_SECRET": bool(os.getenv("REDDIT_CLIENT_SECRET")),
+            "REDDIT_USER_AGENT": bool(os.getenv("REDDIT_USER_AGENT")),
             "OPENROUTER_API_KEY": bool(os.getenv("OPENROUTER_API_KEY")),
             "REDDIT_GCP_PROJECT": bool(os.getenv("REDDIT_GCP_PROJECT")),
         }
