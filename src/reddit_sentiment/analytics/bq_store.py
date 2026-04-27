@@ -237,7 +237,8 @@ class BigQueryStore:
             query += " AND DATE(measured_at) <= @end_date"
             params.append(bigquery.ScalarQueryParameter("end_date", "DATE", end_date))
 
-        query += f" ORDER BY measured_at DESC LIMIT {limit}"
+        query += " ORDER BY measured_at DESC LIMIT @limit"
+        params.append(bigquery.ScalarQueryParameter("limit", "INT64", max(1, min(limit, 10000))))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         results = self.client.query(query, job_config=job_config).result()
@@ -453,7 +454,8 @@ class BigQueryStore:
             query += " AND keyword = @keyword"
             params.append(bigquery.ScalarQueryParameter("keyword", "STRING", keyword))
 
-        query += f" ORDER BY opportunity_score DESC LIMIT {limit}"
+        query += " ORDER BY opportunity_score DESC LIMIT @limit"
+        params.append(bigquery.ScalarQueryParameter("limit", "INT64", max(1, min(limit, 1000))))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         results = self.client.query(query, job_config=job_config).result()
@@ -783,7 +785,8 @@ class BigQueryStore:
             query += " AND DATE(measured_at) <= @end_date"
             params.append(bigquery.ScalarQueryParameter("end_date", "DATE", end_date))
 
-        query += f" ORDER BY measured_at DESC LIMIT {limit}"
+        query += " ORDER BY measured_at DESC LIMIT @limit"
+        params.append(bigquery.ScalarQueryParameter("limit", "INT64", max(1, min(limit, 10000))))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         results = self.client.query(query, job_config=job_config).result()

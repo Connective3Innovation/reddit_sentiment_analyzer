@@ -93,24 +93,60 @@ class OpenRouterClient:
             data = response.json()
             return data["choices"][0]["message"]["content"]
         except httpx.HTTPStatusError as e:
-            logger.error(f"OpenRouter API error: {e.response.status_code}")
+            # Include response body for better debugging
+            error_body = ""
+            try:
+                error_body = e.response.text[:500]
+            except Exception:
+                pass
+            logger.error(
+                f"OpenRouter API error: {e.response.status_code} - {error_body}"
+            )
+            raise
+        except httpx.TimeoutException as e:
+            logger.error(f"OpenRouter request timed out after {self.timeout}s")
             raise
         except Exception as e:
-            logger.error(f"OpenRouter request failed: {e}")
+            logger.error(f"OpenRouter request failed: {type(e).__name__}: {e}")
             raise
 
     def _parse_json_response(self, response: str) -> dict:
-        """Parse JSON from LLM response, handling markdown code blocks."""
-        # Strip markdown code blocks if present
+        """Parse JSON from LLM response, handling various markdown formats."""
         text = response.strip()
-        if text.startswith("```json"):
-            text = text[7:]
+
+        # Handle various markdown code block formats
+        # ```json\n{...}\n``` or ```\n{...}\n```
         if text.startswith("```"):
-            text = text[3:]
+            # Find the end of the opening fence
+            first_newline = text.find("\n")
+            if first_newline != -1:
+                text = text[first_newline + 1:]
+            else:
+                text = text[3:]
+
         if text.endswith("```"):
             text = text[:-3]
 
-        return json.loads(text.strip())
+        text = text.strip()
+
+        # Try parsing as-is first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Try to extract JSON object from text (handles LLM adding extra text)
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Log the raw response for debugging and raise
+        logger.error(f"Failed to parse JSON from LLM response: {text[:500]}...")
+        raise json.JSONDecodeError("Could not extract valid JSON from response", text, 0)
 
     def extract_themes(
         self,
@@ -427,6 +463,99 @@ class OpenRouterClient:
                 "competitive_insights": [],
                 "actionable_recommendations": [],
                 "risk_signals": [],
+            }
+
+    def run_unified_analysis(
+        self,
+        primary_brand: str,
+        industry: str,
+        period_days: int,
+        comments_df,  # pandas DataFrame with sentiment_score, body, score columns
+        model: Optional[str] = None,
+    ) -> dict:
+        """
+        Run unified analysis with stratified sampling (RECOMMENDED - single API call).
+
+        This method replaces the need for separate calls to:
+        - extract_themes()
+        - analyze_competitive_intelligence()
+        - identify_opportunities()
+
+        Cost: ~$0.03-0.10 (vs ~$0.15-0.30 for 3 separate calls)
+
+        Args:
+            primary_brand: Brand being analyzed
+            industry: Industry sector
+            period_days: Days of data analyzed
+            comments_df: DataFrame with columns: body, sentiment_score, score (optional)
+            model: LLM model to use (defaults to gpt-4o)
+
+        Returns:
+            Comprehensive analysis dict with all insights in one response
+        """
+        from .prompts_v2 import UNIFIED_ANALYSIS_PROMPT, build_stratified_samples
+
+        # Build stratified samples for balanced coverage
+        samples = build_stratified_samples(comments_df)
+
+        # Calculate metrics from DataFrame
+        comments_analyzed = len(comments_df)
+        mean_sentiment = float(comments_df["sentiment_score"].mean()) if "sentiment_score" in comments_df.columns else 0.0
+
+        if "sentiment_label" in comments_df.columns:
+            positive_pct = (comments_df["sentiment_label"] == "positive").sum() / max(comments_analyzed, 1) * 100
+            neutral_pct = (comments_df["sentiment_label"] == "neutral").sum() / max(comments_analyzed, 1) * 100
+            negative_pct = (comments_df["sentiment_label"] == "negative").sum() / max(comments_analyzed, 1) * 100
+        else:
+            positive_pct = neutral_pct = negative_pct = 33.3
+
+        prompt = UNIFIED_ANALYSIS_PROMPT.format(
+            primary_brand=primary_brand,
+            industry=industry,
+            period_days=period_days,
+            comments_analyzed=comments_analyzed,
+            mean_sentiment=mean_sentiment,
+            positive_pct=positive_pct,
+            neutral_pct=neutral_pct,
+            negative_pct=negative_pct,
+            positive_samples=samples["positive_samples"],
+            negative_samples=samples["negative_samples"],
+            neutral_samples=samples.get("neutral_samples", "No neutral comments available."),
+            engagement_samples=samples["engagement_samples"],
+        )
+
+        model = model or "openai/gpt-4o"
+
+        try:
+            response = self._call_api(
+                prompt,
+                model=model,
+                system_prompt="You are a senior competitive intelligence analyst. Respond only with valid JSON. Be specific and evidence-based.",
+                temperature=0.5,
+            )
+            result = self._parse_json_response(response)
+
+            # Normalize field names for compatibility with existing code
+            if "verified_pain_points" in result and "top_pain_points" not in result:
+                result["top_pain_points"] = [
+                    p.get("issue", "") for p in result["verified_pain_points"]
+                ]
+            if "content_opportunities" in result and "opportunities" not in result:
+                result["opportunities"] = result["content_opportunities"]
+
+            return result
+        except Exception as e:
+            logger.error(f"Unified analysis failed: {e}")
+            return {
+                "executive_summary": f"Analysis failed: {str(e)}",
+                "brand_perception": {},
+                "verified_pain_points": [],
+                "competitors_mentioned": [],
+                "key_themes": [],
+                "content_opportunities": [],
+                "actionable_recommendations": [],
+                "risk_signals": [],
+                "competitive_position": {},
             }
 
     def close(self):

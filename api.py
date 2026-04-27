@@ -33,7 +33,7 @@ from functools import lru_cache
 try:
     from fastapi.responses import ORJSONResponse  # type: ignore
     DEFAULT_RESPONSE_CLASS = ORJSONResponse
-except Exception:
+except ImportError:
     DEFAULT_RESPONSE_CLASS = JSONResponse
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,48 +48,48 @@ def _import_path_variants():
     try:
         from reddit_sentiment.pipeline.etl import run_etl as _run_etl
         mod["run_etl"] = _run_etl
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         try:
             from etl import run_etl as _run_etl  # type: ignore
             mod["run_etl"] = _run_etl
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             mod["run_etl"] = None
 
     # Collector / preprocess
     try:
         from reddit_sentiment.data.collector import collect as _collect
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         try:
             from collector import collect as _collect  # type: ignore
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             _collect = None
     mod["collect"] = _collect
 
     try:
         from reddit_sentiment.data.preprocess import apply_cleaning as _clean
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         try:
             from preprocess import apply_cleaning as _clean  # type: ignore
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             _clean = None
     mod["clean"] = _clean
 
     # Engines
     try:
         from reddit_sentiment.sentiment.hf_engine import HfEngine as _Hf
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         try:
             from hf_engine import HfEngine as _Hf  # type: ignore
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             _Hf = None
     mod["HfEngine"] = _Hf
 
     try:
         from reddit_sentiment.sentiment.vader_engine import VaderEngine as _Vader
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         try:
             from vader_engine import VaderEngine as _Vader  # type: ignore
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             _Vader = None
     mod["VaderEngine"] = _Vader
 
@@ -349,13 +349,20 @@ app = FastAPI(
     default_response_class=DEFAULT_RESPONSE_CLASS,
 )
 
-# CORS first
+# CORS configuration
+# In production, set ALLOWED_ORIGINS env var to restrict access
+_cors_origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
+_cors_origins = [o.strip() for o in _cors_origins if o.strip()]
+if not _cors_origins:
+    # Default to localhost for development; override in production
+    _cors_origins = ["http://localhost:3000", "http://localhost:8501", "http://127.0.0.1:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,  # keep False with wildcard origins
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Then GZip once

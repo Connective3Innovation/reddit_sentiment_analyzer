@@ -13,6 +13,12 @@ __pycache__/
 /data/
 *.parquet
 
+# Scripts (local analysis)
+/scripts/
+
+# LLM cache
+.llm_cache/
+
 # IDEs
 .vscode/
 .idea/

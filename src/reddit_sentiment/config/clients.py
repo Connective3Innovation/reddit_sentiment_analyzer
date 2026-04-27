@@ -10,10 +10,12 @@ Each client has:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
-import os
 import json
+import os
+import threading
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Optional
 
 
 @dataclass
@@ -101,20 +103,43 @@ DEFAULT_CLIENTS: dict[str, ClientConfig] = {
         client_name="Capital One",
         primary_brand="capital one",
         search_keywords=[
-            # Product-specific searches
+            # Business credit cards
+            "capital one business credit card",
+            "capital one business card",
+            "capital one business credit cards",
+            "capital one credit card for small business",
+            "business credit card capital one",
+            "capital one credit card business",
+            "capital one credit card for business",
+            "capital one small business credit card",
+            "capital one small business credit cards",
+            "capital one credit cards for business",
+            "business credit cards capital one",
+            "capital one business rewards card",
+            "capital one credit card small business",
+            "capital one quicksilver business card",
+            "capital one spark business credit card",
+            "capital one venture business card",
+            # General credit cards
             "capital one credit card",
+            "best capital one credit card",
+            "is capital one a good credit card",
+            "capital one 0 interest credit card",
+            "capital one no interest credit card",
+            "capital one credit card rewards",
+            "secured credit card capital one",
+            "credit card capital one",
+            # Popular products (high volume)
             "capital one venture",
             "capital one quicksilver",
             "capital one savor",
             "capital one venture x",
-            # Banking products
             "capital one 360",
             "capital one savings",
             "capital one checking",
-            # Brand variations
+            # Brand variations & discussions
             "capitalone",
             "cap one card",
-            # Common discussions
             "capital one rewards",
             "capital one approval",
             "capital one customer service",
@@ -145,13 +170,10 @@ class ClientRegistry:
         self._clients: dict[str, ClientConfig] = {}
         self._load_defaults()
 
-        if config_path and os.path.exists(config_path):
-            self._load_from_file(config_path)
-
-        # Also check environment variable
-        env_config = os.getenv("REDDIT_CLIENTS_CONFIG")
-        if env_config and os.path.exists(env_config):
-            self._load_from_file(env_config)
+        # Use config_path if provided, otherwise fall back to env var (not both)
+        resolved_path = config_path or os.getenv("REDDIT_CLIENTS_CONFIG")
+        if resolved_path and os.path.exists(resolved_path):
+            self._load_from_file(resolved_path)
 
     def _load_defaults(self):
         """Load default client configurations."""
@@ -242,16 +264,16 @@ class ClientRegistry:
         return config
 
 
-# Global registry instance
-_registry: Optional[ClientRegistry] = None
-
-
+# Thread-safe singleton registry using lru_cache
+@lru_cache(maxsize=1)
 def get_registry() -> ClientRegistry:
-    """Get the global client registry."""
-    global _registry
-    if _registry is None:
-        _registry = ClientRegistry()
-    return _registry
+    """Get the global client registry (thread-safe singleton)."""
+    return ClientRegistry()
+
+
+def reset_registry() -> None:
+    """Reset the registry cache (useful for testing)."""
+    get_registry.cache_clear()
 
 
 def get_client(client_id: str) -> Optional[ClientConfig]:

@@ -99,22 +99,26 @@ def run_analysis(
     print(f'\n[2/{total_steps}] Applying text cleaning...')
     comments_df = apply_cleaning(comments_df)
 
-    print(f'\n[3/{total_steps}] Running sentiment analysis (HuggingFace)...')
+    print(f'\n[3/{total_steps}] Running sentiment analysis (HuggingFace 3-class)...')
     engine = HfEngine()
     sentiment_df = engine.run(comments_df['body'].tolist())
 
-    # Convert HfEngine output (POSITIVE/NEGATIVE + prob) to -1 to +1 scale
-    # prob is confidence (0.5-1.0), convert to sentiment_score:
-    #   POSITIVE: score = (prob - 0.5) * 2  → 0.5→0, 1.0→+1
-    #   NEGATIVE: score = -((prob - 0.5) * 2) → 0.5→0, 1.0→-1
+    # Convert 3-class sentiment (POSITIVE/NEUTRAL/NEGATIVE) to numeric score
     def convert_to_score(row):
-        scaled = (row['prob'] - 0.5) * 2
-        return scaled if row['sentiment'] == 'POSITIVE' else -scaled
+        sentiment = row['sentiment']
+        confidence = float(row['prob']) if row['prob'] is not None else 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        if sentiment == 'POSITIVE':
+            return confidence
+        elif sentiment == 'NEGATIVE':
+            return -confidence
+        else:  # NEUTRAL
+            return 0.0
 
     comments_df['sentiment_score'] = sentiment_df.apply(convert_to_score, axis=1)
-    comments_df['sentiment_label'] = comments_df['sentiment_score'].apply(
-        lambda x: 'positive' if x >= 0.05 else ('negative' if x <= -0.05 else 'neutral')
-    )
+    # Use model's 3-class labels directly
+    comments_df['sentiment_label'] = sentiment_df['sentiment'].str.lower()
 
     # Competitive analysis using client config
     print(f'\n[4/{total_steps}] Analyzing competitor mentions...')
@@ -141,7 +145,7 @@ def run_analysis(
 
 
 def _run_llm_analysis(snapshot, comments_df, client_config: ClientConfig):
-    """Run LLM deep analysis and update snapshot."""
+    """Run LLM deep analysis using unified analysis (single API call)."""
     try:
         from reddit_sentiment.llm.openrouter_client import OpenRouterClient
     except ImportError as e:
@@ -153,54 +157,71 @@ def _run_llm_analysis(snapshot, comments_df, client_config: ClientConfig):
         print('      [!] OPENROUTER_API_KEY not set, skipping LLM analysis')
         return snapshot
 
+    # Try to use cache
     try:
-        # Format competitor summary for LLM
-        competitor_summary = ""
-        for comp in snapshot.competitors[:10]:
-            competitor_summary += f"\n- {comp.competitor.upper()}: {comp.mention_count} mentions, "
-            competitor_summary += f"sentiment={comp.avg_sentiment:.2f}, "
-            competitor_summary += f"switch_to={comp.switch_to_count}, switch_from={comp.switch_from_count}"
-            if comp.better_at:
-                competitor_summary += f", praised for: {', '.join(comp.better_at[:2])}"
-            if comp.worse_at:
-                competitor_summary += f", criticized for: {', '.join(comp.worse_at[:2])}"
+        from reddit_sentiment.llm.cache import get_cached_result, save_to_cache
+        cache_available = True
+    except ImportError:
+        cache_available = False
 
-        # Get high-engagement sample comments
-        sample_comments = []
-        if 'score' in comments_df.columns:
-            top_comments = comments_df.nlargest(20, 'score')['body'].tolist()
-            sample_comments = top_comments
-        else:
-            sample_comments = comments_df['body'].head(20).tolist()
+    result = None
 
-        print('      Calling OpenRouter API...')
-        with OpenRouterClient(api_key=api_key) as client:
-            result = client.analyze_competitive_intelligence(
-                primary_brand=client_config.primary_brand,
-                industry=client_config.industry,
-                period_days=snapshot.period_days,
-                comments_analyzed=snapshot.comments_analyzed,
-                mean_sentiment=snapshot.primary_sentiment,
-                positive_pct=snapshot.primary_positive_pct,
-                neutral_pct=snapshot.primary_neutral_pct,
-                negative_pct=snapshot.primary_negative_pct,
-                competitor_summary=competitor_summary,
-                pain_points=snapshot.top_pain_points,
-                sample_comments=sample_comments,
-            )
+    # Check cache first
+    if cache_available:
+        cached = get_cached_result(
+            primary_brand=client_config.primary_brand,
+            industry=client_config.industry,
+            period_days=snapshot.period_days,
+            comment_count=len(comments_df),
+            max_age_hours=24,
+        )
+        if cached:
+            result = cached
+            print('      Using cached LLM analysis (< 24h old)')
 
-        # Update snapshot with LLM insights
+    # Run unified analysis if no cache hit
+    if not result:
+        try:
+            print('      Calling OpenRouter API (unified analysis)...')
+            with OpenRouterClient(api_key=api_key) as client:
+                result = client.run_unified_analysis(
+                    primary_brand=client_config.primary_brand,
+                    industry=client_config.industry,
+                    period_days=snapshot.period_days,
+                    comments_df=comments_df,
+                )
+
+            # Save to cache
+            if cache_available and result and result.get('executive_summary'):
+                save_to_cache(
+                    result=result,
+                    primary_brand=client_config.primary_brand,
+                    industry=client_config.industry,
+                    period_days=snapshot.period_days,
+                    comment_count=len(comments_df),
+                )
+                print('      Cached LLM result for future use')
+
+        except Exception as e:
+            print(f'      [!] LLM analysis failed: {e}')
+            return snapshot
+
+    # Update snapshot with LLM insights
+    if result:
         snapshot.llm_executive_summary = result.get('executive_summary')
-        snapshot.llm_themes = result.get('themes', [])
+        snapshot.llm_themes = result.get('key_themes', result.get('themes', []))
         snapshot.llm_unanswered_questions = result.get('unanswered_questions', [])
-        snapshot.llm_competitive_insights = result.get('competitive_insights', [])
+        snapshot.llm_competitive_insights = result.get('competitors_mentioned', result.get('competitive_insights', []))
         snapshot.llm_recommendations = result.get('actionable_recommendations', [])
         snapshot.llm_risk_signals = result.get('risk_signals', [])
 
-        print('      LLM analysis complete!')
+        # Additional fields from unified analysis
+        if result.get('brand_perception'):
+            snapshot.llm_brand_perception = result.get('brand_perception')
+        if result.get('competitive_position'):
+            snapshot.llm_competitive_position = result.get('competitive_position')
 
-    except Exception as e:
-        print(f'      [!] LLM analysis failed: {e}')
+        print('      LLM analysis complete!')
 
     return snapshot
 

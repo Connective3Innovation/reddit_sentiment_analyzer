@@ -24,6 +24,70 @@ if TYPE_CHECKING:
     from ..config.clients import ClientConfig
 
 
+# Industry-specific topic patterns
+# Common patterns applicable to all industries
+_COMMON_PATTERNS: dict[str, str] = {
+    "customer service": r"(customer service|support|help|representative|agent|chat)",
+    "mobile app": r"(app|mobile|interface|ui|ux)",
+    "website": r"(website|site|online|portal|login)",
+    "pricing": r"(price|pricing|cost|expensive|cheap|afford)",
+    "quality": r"(quality|reliable|broken|buggy|works|doesn't work)",
+}
+
+_INDUSTRY_PATTERNS: dict[str, dict[str, str]] = {
+    "financial_services": {
+        "interest rates": r"(interest|apr|rate|yield|apy)",
+        "rewards": r"(reward|points|cashback|cash back|miles|bonus)",
+        "fees": r"(fee|charge|cost|free|no fee|annual fee)",
+        "credit limit": r"(credit limit|limit increase|cli)",
+        "approval": r"(approv|denied|reject|accept|hard pull|soft pull)",
+        "transfer": r"(transfer|balance transfer|bt)",
+        "fraud protection": r"(fraud|security|protect|safe|unauthorized)",
+    },
+    "tech": {
+        "performance": r"(fast|slow|lag|performance|speed|crash)",
+        "features": r"(feature|functionality|capability|update)",
+        "integration": r"(integrat|api|connect|sync|compatible)",
+        "security": r"(security|privacy|encrypt|breach|hack)",
+        "reliability": r"(uptime|downtime|outage|reliable|stable)",
+    },
+    "retail": {
+        "shipping": r"(ship|delivery|arrived|package|tracking)",
+        "returns": r"(return|refund|exchange|warranty)",
+        "product quality": r"(quality|defect|broken|damaged|fake)",
+        "selection": r"(selection|variety|stock|available|out of stock)",
+        "value": r"(value|worth|deal|overpriced|bargain)",
+    },
+    "saas": {
+        "onboarding": r"(onboard|setup|getting started|learning curve)",
+        "features": r"(feature|functionality|capability|roadmap)",
+        "integration": r"(integrat|api|connect|sync|zapier|webhook)",
+        "pricing model": r"(pricing|tier|plan|subscription|per seat|per user)",
+        "support response": r"(response time|ticket|wait|resolved)",
+    },
+}
+
+
+def get_topic_patterns(industry: str = "financial_services") -> dict[str, str]:
+    """
+    Get topic patterns for a specific industry.
+
+    Args:
+        industry: Industry identifier (financial_services, tech, retail, saas)
+
+    Returns:
+        Dict of topic name -> regex pattern
+    """
+    patterns = _COMMON_PATTERNS.copy()
+    industry_specific = _INDUSTRY_PATTERNS.get(industry.lower(), {})
+    patterns.update(industry_specific)
+    return patterns
+
+
+# Default patterns for backwards compatibility
+TOPIC_PATTERNS: dict[str, str] = get_topic_patterns("financial_services")
+
+
 @dataclass
 class CompetitorMention:
     """A single competitor mention in a comment."""
@@ -96,10 +160,15 @@ class CompetitorAnalyzer:
             self.primary_brand = client_config.primary_brand.lower()
             self.competitors = client_config.competitors
             self.client_id = client_config.client_id
+            self.industry = client_config.industry
         else:
             self.primary_brand = primary_brand.lower()
             self.competitors = competitors or _get_default_competitors()
             self.client_id = None
+            self.industry = "financial_services"  # Default for backwards compatibility
+
+        # Get industry-specific topic patterns
+        self._topic_patterns = get_topic_patterns(self.industry)
 
         # Build regex patterns for each competitor
         self._patterns = {}
@@ -140,10 +209,23 @@ class CompetitorAnalyzer:
         Returns:
             List of CompetitorMention objects
         """
+        if df.empty or text_col not in df.columns:
+            return []
+
         mentions = []
 
-        for _, row in df.iterrows():
-            text = str(row.get(text_col, ""))
+        # Use itertuples for ~10x speedup over iterrows
+        # Pre-fetch column indices for faster access
+        cols = df.columns.tolist()
+        text_idx = cols.index(text_col)
+        comment_id_idx = cols.index("comment_id") if "comment_id" in cols else None
+        sentiment_score_idx = cols.index("sentiment_score") if "sentiment_score" in cols else None
+        sentiment_label_idx = cols.index("sentiment_label") if "sentiment_label" in cols else None
+        subreddit_idx = cols.index("subreddit") if "subreddit" in cols else None
+        created_utc_idx = cols.index("created_utc") if "created_utc" in cols else None
+
+        for row in df.itertuples(index=False):
+            text = str(row[text_idx]) if row[text_idx] else ""
             if not text:
                 continue
 
@@ -158,12 +240,12 @@ class CompetitorAnalyzer:
 
                     mention = CompetitorMention(
                         competitor=competitor,
-                        comment_id=str(row.get("comment_id", "")),
+                        comment_id=str(row[comment_id_idx]) if comment_id_idx is not None else "",
                         body=text[:500],  # Truncate for storage
-                        sentiment_score=float(row.get("sentiment_score", 0)),
-                        sentiment_label=str(row.get("sentiment_label", "neutral")),
-                        subreddit=str(row.get("subreddit", "")),
-                        created_utc=row.get("created_utc", datetime.now(timezone.utc)),
+                        sentiment_score=float(row[sentiment_score_idx]) if sentiment_score_idx is not None and row[sentiment_score_idx] is not None else 0.0,
+                        sentiment_label=str(row[sentiment_label_idx]) if sentiment_label_idx is not None else "neutral",
+                        subreddit=str(row[subreddit_idx]) if subreddit_idx is not None else "",
+                        created_utc=row[created_utc_idx] if created_utc_idx is not None else datetime.now(timezone.utc),
                         context=context,
                         comparison_type=comparison_type,
                     )
@@ -409,21 +491,7 @@ class CompetitorAnalyzer:
             top_n: Max topics to return
             sentiment_filter: Optional filter - "positive" or "negative"
         """
-        # Common financial service topics
-        topic_patterns = {
-            "customer service": r"(customer service|support|help|representative|agent)",
-            "mobile app": r"(app|mobile|interface|ui|ux)",
-            "interest rates": r"(interest|apr|rate|yield|apy)",
-            "rewards": r"(reward|points|cashback|cash back|miles|bonus)",
-            "fees": r"(fee|charge|cost|free|no fee)",
-            "credit limit": r"(credit limit|limit increase|cli)",
-            "approval": r"(approv|denied|reject|accept)",
-            "transfer": r"(transfer|balance transfer|bt)",
-            "fraud protection": r"(fraud|security|protect|safe)",
-            "website": r"(website|site|online|portal)",
-        }
-
-        topic_counts = {topic: 0 for topic in topic_patterns}
+        topic_counts = {topic: 0 for topic in self._topic_patterns}
 
         for mention in mentions:
             # Apply sentiment filter if specified
@@ -433,7 +501,7 @@ class CompetitorAnalyzer:
                 continue
 
             context_lower = mention.context.lower()
-            for topic, pattern in topic_patterns.items():
+            for topic, pattern in self._topic_patterns.items():
                 if re.search(pattern, context_lower):
                     topic_counts[topic] += 1
 
@@ -454,19 +522,6 @@ class CompetitorAnalyzer:
         If a topic appears in both, keep it only in the list where it has
         more mentions with matching sentiment.
         """
-        topic_patterns = {
-            "customer service": r"(customer service|support|help|representative|agent)",
-            "mobile app": r"(app|mobile|interface|ui|ux)",
-            "interest rates": r"(interest|apr|rate|yield|apy)",
-            "rewards": r"(reward|points|cashback|cash back|miles|bonus)",
-            "fees": r"(fee|charge|cost|free|no fee)",
-            "credit limit": r"(credit limit|limit increase|cli)",
-            "approval": r"(approv|denied|reject|accept)",
-            "transfer": r"(transfer|balance transfer|bt)",
-            "fraud protection": r"(fraud|security|protect|safe)",
-            "website": r"(website|site|online|portal)",
-        }
-
         # Find topics that appear in both lists
         duplicates = set(better_at) & set(worse_at)
 
@@ -475,7 +530,7 @@ class CompetitorAnalyzer:
 
         # Count sentiment-aligned mentions for each duplicate topic
         for topic in duplicates:
-            pattern = topic_patterns.get(topic, topic)
+            pattern = self._topic_patterns.get(topic, topic)
 
             # Count positive sentiment mentions for this topic
             pos_count = sum(

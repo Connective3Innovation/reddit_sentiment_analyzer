@@ -36,6 +36,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
+import re
+from collections import Counter
+
+# Optional: ECharts for word cloud (graceful fallback if not installed)
+try:
+    from streamlit_echarts import st_echarts
+    ECHARTS_AVAILABLE = True
+except ImportError:
+    ECHARTS_AVAILABLE = False
+    st_echarts = None
 
 # Page config
 st.set_page_config(
@@ -349,8 +359,10 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
         keywords_to_search = client_config.search_keywords[:max_keywords]
 
         for i, kw in enumerate(keywords_to_search):
+            # Scale progress dynamically: 5% to 25% across all keywords
+            search_progress = int(5 + (i + 1) / len(keywords_to_search) * 20)
             progress.progress(
-                5 + (i * 5),
+                search_progress,
                 text=f"Searching for '{kw}' ({i+1}/{len(keywords_to_search)})..."
             )
             try:
@@ -382,19 +394,32 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
     progress.progress(30, text="Cleaning text...")
     comments_df = apply_cleaning(comments_df)
 
-    # Step 3: Sentiment analysis
+    # Step 3: Sentiment analysis (using 3-class model: positive/neutral/negative)
     progress.progress(50, text="Running HuggingFace sentiment analysis...")
     engine = HfEngine()
     sentiment_df = engine.run(comments_df["body"].tolist())
 
     def convert_to_score(row):
-        scaled = (row["prob"] - 0.5) * 2
-        return scaled if row["sentiment"] == "POSITIVE" else -scaled
+        """Convert 3-class sentiment to numeric score.
+
+        POSITIVE → +confidence (0 to +1)
+        NEUTRAL  → 0 (no strong sentiment)
+        NEGATIVE → -confidence (0 to -1)
+        """
+        sentiment = row["sentiment"]
+        confidence = float(row["prob"]) if row["prob"] is not None else 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        if sentiment == "POSITIVE":
+            return confidence
+        elif sentiment == "NEGATIVE":
+            return -confidence
+        else:  # NEUTRAL
+            return 0.0
 
     comments_df["sentiment_score"] = sentiment_df.apply(convert_to_score, axis=1)
-    comments_df["sentiment_label"] = comments_df["sentiment_score"].apply(
-        lambda x: "positive" if x >= 0.05 else ("negative" if x <= -0.05 else "neutral")
-    )
+    # Use model's 3-class labels directly, with fallback to score-based
+    comments_df["sentiment_label"] = sentiment_df["sentiment"].str.lower()
 
     # Store dataframes for other analyses
     st.session_state.posts_df = posts_df
@@ -454,81 +479,67 @@ def run_llm_analysis(snapshot, comments_df, client_config):
         st.warning(st.session_state.llm_error)
         return snapshot
 
-    # Get sample comments for LLM analysis
-    if "score" in comments_df.columns:
-        sample_comments = comments_df.nlargest(50, "score")["body"].tolist()
-    else:
-        sample_comments = comments_df["body"].head(50).tolist()
-
-    st.session_state.llm_debug["sample_comments_count"] = len(sample_comments)
-
-    themes = []
-    result = {}
-    llm_opportunities = []
-
+    # Import caching utilities
     try:
-        with OpenRouterClient(api_key=api_key) as client:
-            # 1. Dedicated Theme Extraction
-            st.text("Extracting discussion themes...")
-            try:
-                themes = client.extract_themes(
-                    comments=sample_comments,
-                    keyword=client_config.primary_brand,
-                )
-                st.session_state.llm_debug["themes_count"] = len(themes) if themes else 0
-                st.session_state.llm_debug["themes_success"] = True
-            except Exception as e:
-                st.session_state.llm_debug["themes_error"] = str(e)
-                st.session_state.llm_debug["themes_success"] = False
-                st.warning(f"Theme extraction failed: {e}")
+        from reddit_sentiment.llm.cache import get_cached_result, save_to_cache
+        cache_available = True
+    except ImportError:
+        cache_available = False
 
-            # 2. Competitive Intelligence Analysis
-            st.text("Analyzing competitive intelligence...")
-            try:
-                result = client.analyze_competitive_intelligence(
+    st.session_state.llm_debug["comments_count"] = len(comments_df)
+    st.session_state.llm_debug["cache_available"] = cache_available
+
+    result = {}
+
+    # Check cache first (avoids repeat API calls)
+    if cache_available:
+        cached = get_cached_result(
+            primary_brand=client_config.primary_brand,
+            industry=client_config.industry,
+            period_days=snapshot.period_days,
+            comment_count=len(comments_df),
+            max_age_hours=24,
+        )
+        if cached:
+            result = cached
+            st.session_state.llm_debug["cache_hit"] = True
+            st.info("📦 Using cached LLM analysis (less than 24h old)")
+
+    # If no cache hit, run unified analysis (single API call)
+    if not result:
+        st.session_state.llm_debug["cache_hit"] = False
+        try:
+            with OpenRouterClient(api_key=api_key) as client:
+                st.text("Running unified LLM analysis (stratified sampling)...")
+
+                result = client.run_unified_analysis(
                     primary_brand=client_config.primary_brand,
                     industry=client_config.industry,
                     period_days=snapshot.period_days,
-                    comments_analyzed=snapshot.comments_analyzed,
-                    mean_sentiment=snapshot.primary_sentiment,
-                    positive_pct=snapshot.primary_positive_pct,
-                    neutral_pct=snapshot.primary_neutral_pct,
-                    negative_pct=snapshot.primary_negative_pct,
-                    competitor_summary="",
-                    pain_points=snapshot.top_pain_points,
-                    sample_comments=sample_comments,
+                    comments_df=comments_df,
                 )
-                st.session_state.llm_debug["ci_keys"] = list(result.keys()) if result else []
-                st.session_state.llm_debug["ci_success"] = True
-                st.session_state.llm_debug["ci_result"] = result
-            except Exception as e:
-                st.session_state.llm_debug["ci_error"] = str(e)
-                st.session_state.llm_debug["ci_success"] = False
-                st.warning(f"Competitive intelligence failed: {e}")
 
-            # 3. Content Opportunity Identification
-            st.text("Identifying content opportunities...")
-            try:
-                llm_opportunities = client.identify_opportunities(
-                    comments=sample_comments,
-                    keyword=client_config.primary_brand,
-                    positive_pct=snapshot.primary_positive_pct,
-                    neutral_pct=snapshot.primary_neutral_pct,
-                    negative_pct=snapshot.primary_negative_pct,
-                )
-                st.session_state.llm_debug["opportunities_count"] = len(llm_opportunities) if llm_opportunities else 0
-                st.session_state.llm_debug["opportunities_success"] = True
-            except Exception as e:
-                st.session_state.llm_debug["opportunities_error"] = str(e)
-                st.session_state.llm_debug["opportunities_success"] = False
-                st.warning(f"Opportunity identification failed: {e}")
+                st.session_state.llm_debug["unified_success"] = True
+                st.session_state.llm_debug["result_keys"] = list(result.keys()) if result else []
 
-    except Exception as e:
-        st.session_state.llm_error = f"LLM client error: {e}\n{traceback.format_exc()}"
-        st.error(st.session_state.llm_error)
-        return snapshot
+                # Save to cache for future use
+                if cache_available and result and "executive_summary" in result:
+                    save_to_cache(
+                        result=result,
+                        primary_brand=client_config.primary_brand,
+                        industry=client_config.industry,
+                        period_days=snapshot.period_days,
+                        comment_count=len(comments_df),
+                    )
+                    st.session_state.llm_debug["cache_saved"] = True
 
-    # Store LLM results (even partial results)
+        except Exception as e:
+            st.session_state.llm_error = f"LLM analysis error: {e}\n{traceback.format_exc()}"
+            st.session_state.llm_debug["unified_error"] = str(e)
+            st.error(st.session_state.llm_error)
+            return snapshot
+
+    # Map unified result to snapshot fields
     if result:
         snapshot.llm_executive_summary = result.get("executive_summary")
         snapshot.llm_brand_perception = result.get("brand_perception", {})
@@ -537,37 +548,33 @@ def run_llm_analysis(snapshot, comments_df, client_config):
         snapshot.llm_recommendations = result.get("actionable_recommendations", [])
         snapshot.llm_risk_signals = result.get("risk_signals", [])
 
-    # Use dedicated theme extraction results
-    if themes:
-        snapshot.llm_themes = [
-            {
-                "theme": t.name,
-                "description": t.description or f"Keywords: {', '.join(t.keywords)}",
-                "sentiment": t.sentiment,  # positive, negative, mixed
-                "sample_quote": t.sample_comments[0] if t.sample_comments else "",
-                "keywords": t.keywords,
-            }
-            for t in themes
-        ]
-    elif result:
+        # Themes from unified analysis
         snapshot.llm_themes = result.get("key_themes", result.get("themes", []))
 
-    # Store LLM-identified opportunities
-    if llm_opportunities:
-        st.session_state.llm_opportunities = llm_opportunities
+        # Content opportunities from unified analysis
+        opportunities = result.get("content_opportunities", result.get("opportunities", []))
+        if opportunities:
+            st.session_state.llm_opportunities = opportunities
+
+        # LLM-verified pain points (more accurate than rule-based)
+        verified_pain_points = result.get("verified_pain_points", [])
+        if verified_pain_points:
+            st.session_state.llm_verified_pain_points = verified_pain_points
+            st.session_state.llm_debug["verified_pain_points"] = len(verified_pain_points)
 
     # Summary
-    success_count = sum(1 for k in ["themes_success", "ci_success", "opportunities_success"]
-                       if st.session_state.llm_debug.get(k))
-    st.success(f"✅ LLM analysis: {success_count}/3 calls succeeded | "
-              f"{len(themes or [])} themes, {len(llm_opportunities or [])} opportunities, "
-              f"{len(snapshot.llm_recommendations or [])} recommendations")
+    cache_status = "📦 cached" if st.session_state.llm_debug.get("cache_hit") else "🔄 fresh"
+    themes_count = len(snapshot.llm_themes or [])
+    opps_count = len(result.get("content_opportunities", []))
+    recs_count = len(snapshot.llm_recommendations or [])
 
-    # Debug: Show what was stored
+    st.success(f"✅ LLM analysis complete ({cache_status}) | "
+              f"{themes_count} themes, {opps_count} opportunities, {recs_count} recommendations")
+
     if snapshot.llm_executive_summary:
-        st.success("✅ LLM executive summary stored")
+        st.success("✅ Executive summary generated")
     else:
-        st.warning("⚠️ LLM analysis did not return executive summary")
+        st.warning("⚠️ No executive summary returned")
 
     return snapshot
 
@@ -623,13 +630,20 @@ def calculate_kpis(posts_df, comments_df, snapshot):
         kpis["sentiment_volatility"] = 0
 
     # Health score (composite)
+    # Clamp each component to 0-1 range before combining
+    positive_component = min(max(kpis["sentiment_positive_pct"] / 100, 0), 1)
+    diversity_component = min(max(kpis["author_diversity"], 0), 1)
+    engagement_component = min(kpis["comments_per_post"] / 10, 1)
+    # Volatility: std dev can exceed 1, so clamp (1 - volatility) to 0-1
+    stability_component = min(max(1 - kpis["sentiment_volatility"], 0), 1)
+
     health_score = (
-        (kpis["sentiment_positive_pct"] / 100) * 0.4  # 40% weight on positive sentiment
-        + kpis["author_diversity"] * 0.2  # 20% weight on author diversity
-        + min(kpis["comments_per_post"] / 10, 1) * 0.2  # 20% weight on engagement
-        + (1 - kpis["sentiment_volatility"]) * 0.2  # 20% weight on stability
+        positive_component * 0.4  # 40% weight on positive sentiment
+        + diversity_component * 0.2  # 20% weight on author diversity
+        + engagement_component * 0.2  # 20% weight on engagement
+        + stability_component * 0.2  # 20% weight on stability
     )
-    kpis["health_score"] = min(max(health_score, 0), 1)  # Clamp 0-1
+    kpis["health_score"] = min(max(health_score, 0), 1)  # Final clamp 0-1
 
     return kpis
 
@@ -816,9 +830,27 @@ def display_results(snapshot):
         else:
             st.info("No immediate opportunities identified")
 
-    # Pain Points
+    # Pain Points - prefer LLM-verified over rule-based
     st.subheader("😤 Top Pain Points")
-    if snapshot.top_pain_points:
+    llm_pain_points = st.session_state.get("llm_verified_pain_points", [])
+    if llm_pain_points:
+        # Show LLM-verified pain points (more accurate)
+        for i, pain in enumerate(llm_pain_points, 1):
+            if isinstance(pain, dict):
+                issue = pain.get("issue", "")
+                severity = pain.get("severity", "medium")
+                quote = pain.get("sample_quote", "")
+                severity_color = {"high": "#dc2626", "medium": "#f59e0b", "low": "#6b7280"}.get(severity, "#f59e0b")
+                st.markdown(f"""
+                <div style="background: #fef2f2; border-left: 4px solid {severity_color}; padding: 0.75rem 1rem; margin-bottom: 0.5rem; border-radius: 0 8px 8px 0;">
+                    <strong>{i}. {issue}</strong>
+                    {f'<br><em style="color: #666;">"{quote[:150]}..."</em>' if quote else ''}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error(f"{i}. {pain}")
+    elif snapshot.top_pain_points:
+        # Fallback to rule-based pain points
         for i, pain in enumerate(snapshot.top_pain_points, 1):
             st.error(f"{i}. {pain}")
     else:
@@ -844,14 +876,24 @@ def display_results(snapshot):
             bp = snapshot.llm_brand_perception
             st.subheader("📊 Brand Perception")
             col1, col2 = st.columns(2)
+
+            # Get positive items (try multiple field names)
+            drivers = bp.get("sentiment_drivers", {})
+            positives = bp.get("brand_strengths") or drivers.get("positive") or bp.get("what_users_love") or []
+            negatives = bp.get("brand_weaknesses") or drivers.get("negative") or bp.get("what_users_hate") or []
+
             with col1:
                 st.write("**What Users Love:**")
-                for item in bp.get("what_users_love", []):
+                for item in positives:
                     st.success(f"✅ {item}")
+                if not positives:
+                    st.info("No specific positives identified")
             with col2:
                 st.write("**What Users Hate:**")
-                for item in bp.get("what_users_hate", []):
+                for item in negatives:
                     st.error(f"❌ {item}")
+                if not negatives:
+                    st.info("No specific negatives identified")
 
         # Competitors Mentioned (LLM-identified)
         if snapshot.llm_competitive_insights:
@@ -859,14 +901,15 @@ def display_results(snapshot):
             for comp in snapshot.llm_competitive_insights:
                 comp_name = comp.get("competitor", "Unknown")
                 with st.expander(f"**{comp_name}**"):
-                    st.write(f"**Context:** {comp.get('context', comp.get('perception', 'N/A'))}")
-                    st.write(f"**Compared to brand:** {comp.get('compared_to_brand', 'N/A')}")
-                    pros = comp.get("competitor_pros", comp.get("strengths_mentioned", []))
-                    cons = comp.get("competitor_cons", comp.get("weaknesses_mentioned", []))
-                    if pros:
-                        st.success(f"Pros: {', '.join(pros)}")
-                    if cons:
-                        st.error(f"Cons: {', '.join(cons)}")
+                    # Map LLM field names to display
+                    context = comp.get("mention_context") or comp.get("context") or comp.get("perception") or "N/A"
+                    perception = comp.get("user_perception") or comp.get("compared_to_brand") or "N/A"
+                    why = comp.get("why_mentioned", "")
+
+                    st.write(f"**Context:** {context}")
+                    st.write(f"**User Perception:** {perception}")
+                    if why:
+                        st.write(f"**Why Mentioned:** {why}")
 
         # Key Themes
         if snapshot.llm_themes:
@@ -935,41 +978,64 @@ def display_opportunities():
         st.success(f"Found {len(llm_opps)} content opportunities via LLM analysis")
 
         for i, opp in enumerate(llm_opps, 1):
-            topic = getattr(opp, 'topic', f'Opportunity {i}')
-            score = getattr(opp, 'opportunity_score', 0.7)
-            score_color = "🟢" if score >= 0.7 else "🟡" if score >= 0.5 else "🔴"
+            # Handle both dict (from LLM) and object (from scorer) formats
+            if isinstance(opp, dict):
+                topic = opp.get('topic', f'Opportunity {i}')
+                opp_type = opp.get('opportunity_type', 'content_gap')
+                target = opp.get('target_audience', '')
+                recommended = opp.get('recommended_content', opp.get('recommended_action', ''))
+                evidence = opp.get('evidence', '')
+            else:
+                topic = getattr(opp, 'topic', f'Opportunity {i}')
+                opp_type = getattr(opp, 'opportunity_type', 'content_gap')
+                target = getattr(opp, 'target_audience', '')
+                recommended = getattr(opp, 'recommended_action', '')
+                evidence = getattr(opp, 'evidence', '')
 
-            with st.expander(f"{score_color} **{topic}** (Score: {score:.0%})"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Engagement", f"{getattr(opp, 'engagement_score', 0.7):.0%}")
-                with col2:
-                    comp = getattr(opp, 'competition_score', 0.3)
-                    st.metric("Competition", f"{comp:.0%}", delta="Low" if comp < 0.4 else "High", delta_color="inverse")
+            # Color based on opportunity type
+            type_colors = {
+                "unanswered_question": "🔴",
+                "confusion": "🟡",
+                "high_interest": "🟢",
+                "emerging_trend": "🔵",
+            }
+            type_icon = type_colors.get(opp_type, "🟢")
 
-                rec = getattr(opp, 'recommended_action', None)
-                if rec:
-                    st.info(f"**Recommended:** {rec}")
+            with st.expander(f"{type_icon} **{topic}**", expanded=(i <= 2)):
+                # Opportunity type badge
+                type_labels = {
+                    "unanswered_question": "Unanswered Question",
+                    "confusion": "User Confusion",
+                    "high_interest": "High Interest Topic",
+                    "emerging_trend": "Emerging Trend",
+                }
+                st.caption(f"Type: {type_labels.get(opp_type, opp_type.replace('_', ' ').title())}")
 
-                evidence = getattr(opp, 'evidence', {})
+                if target:
+                    st.write(f"**Target Audience:** {target}")
+
+                if recommended:
+                    st.info(f"**Recommended Content:** {recommended}")
+
                 if evidence:
-                    if isinstance(evidence, dict):
-                        if evidence.get('reason'):
-                            st.write(f"**Why:** {evidence.get('reason')}")
-                        if evidence.get('target_audience'):
-                            st.write(f"**Target Audience:** {evidence.get('target_audience')}")
-                    else:
-                        st.write(f"**Evidence:** {evidence}")
+                    st.write(f"**Why this matters:** {evidence}")
 
         st.divider()
 
-    # Engagement-based opportunities (secondary)
+    # Engagement-based opportunities (secondary) - only show if LLM opps are empty
     opportunities = st.session_state.opportunities
-    if opportunities:
+    # Filter out generic "General discussion" topics
+    specific_opps = [
+        opp for opp in (opportunities or [])
+        if not getattr(opp, 'topic', '').startswith('General discussion')
+        and not getattr(opp, 'topic', '').startswith('Trending topic:')
+    ]
+
+    if specific_opps and not llm_opps:
         st.subheader("📊 Engagement-Based Opportunities")
         st.caption("Based on comment volume, scores, and engagement patterns")
 
-        for i, opp in enumerate(opportunities[:5], 1):
+        for i, opp in enumerate(specific_opps[:5], 1):
             score_pct = getattr(opp, 'opportunity_score', 0.5) * 100
             score_color = "🟢" if score_pct >= 70 else "🟡" if score_pct >= 50 else "🔴"
             topic = getattr(opp, 'topic', f'Opportunity {i}')
@@ -993,6 +1059,22 @@ def display_opportunities():
                 subreddits = getattr(opp, 'subreddits', [])
                 if subreddits:
                     st.write(f"**Subreddits:** {', '.join(subreddits[:5])}")
+
+    # Show engagement summary even if no specific opportunities
+    elif opportunities and not llm_opps:
+        st.subheader("📊 Engagement Summary")
+        best_opp = opportunities[0] if opportunities else None
+        if best_opp:
+            evidence = getattr(best_opp, 'evidence', {})
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Comments", evidence.get('total_comments', 0))
+            with col2:
+                st.metric("Quality Posts", evidence.get('high_quality_posts', 0))
+            with col3:
+                st.metric("Trend Velocity", f"{evidence.get('trend_velocity', 0):.1f}/day")
+
+            st.info("Enable LLM analysis to identify specific content opportunities from this data.")
 
     if not llm_opps and not opportunities:
         st.info("No content opportunities identified. Enable LLM analysis for better results.")
@@ -1532,15 +1614,24 @@ def display_executive_report(snapshot, client_config):
         st.markdown("### 💭 Brand Perception")
         bp = snapshot.llm_brand_perception
 
+        # Get positive/negative items (try multiple field names)
+        drivers = bp.get("sentiment_drivers", {})
+        positives = bp.get("brand_strengths") or drivers.get("positive") or bp.get("what_users_love") or []
+        negatives = bp.get("brand_weaknesses") or drivers.get("negative") or bp.get("what_users_hate") or []
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**What Users Love:**")
-            for item in bp.get("what_users_love", []):
+            for item in positives:
                 st.success(f"✅ {item}")
+            if not positives:
+                st.info("No specific positives identified")
         with col2:
             st.markdown("**What Users Dislike:**")
-            for item in bp.get("what_users_hate", []):
+            for item in negatives:
                 st.error(f"❌ {item}")
+            if not negatives:
+                st.info("No specific negatives identified")
 
     # Competitive Landscape
     st.markdown("### 🏢 Competitive Landscape")
@@ -1636,10 +1727,25 @@ def display_executive_report(snapshot, client_config):
             if risk.get("evidence"):
                 st.caption(f"Evidence: {risk.get('evidence')}")
 
-    # Pain Points
+    # Pain Points - prefer LLM-verified over rule-based
     st.markdown("### 😤 Customer Pain Points")
-
-    if snapshot.top_pain_points:
+    llm_pain_points = st.session_state.get("llm_verified_pain_points", [])
+    if llm_pain_points:
+        for i, pain in enumerate(llm_pain_points, 1):
+            if isinstance(pain, dict):
+                issue = pain.get("issue", "")
+                severity = pain.get("severity", "medium")
+                quote = pain.get("sample_quote", "")
+                impact = pain.get("business_impact", "")
+                severity_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(severity, "🟡")
+                st.markdown(f"{severity_icon} **{issue}**")
+                if quote:
+                    st.caption(f'"{quote[:200]}..."')
+                if impact:
+                    st.caption(f"Impact: {impact}")
+            else:
+                st.error(f"{i}. {pain}")
+    elif snapshot.top_pain_points:
         for i, pain in enumerate(snapshot.top_pain_points, 1):
             st.error(f"{i}. {pain}")
     else:
@@ -1723,7 +1829,7 @@ def display_executive_report(snapshot, client_config):
                 "risk_signals": snapshot.llm_risk_signals,
                 "threats": snapshot.threats,
                 "opportunities": snapshot.opportunities,
-                "pain_points": snapshot.top_pain_points,
+                "pain_points": st.session_state.get("llm_verified_pain_points") or snapshot.top_pain_points,
             }
             json_str = json.dumps(report_data, indent=2, default=str)
             st.download_button(
@@ -1735,6 +1841,181 @@ def display_executive_report(snapshot, client_config):
 
     with col2:
         st.info("💡 Tip: Use browser print (Ctrl+P) to save as PDF")
+
+
+def extract_keywords_from_comments(comments_df, primary_brand: str, max_words: int = 100) -> list[dict]:
+    """Extract keywords from comments for word cloud visualization.
+
+    Returns list of dicts with 'name' and 'value' keys for ECharts.
+    """
+    if comments_df is None or comments_df.empty or "body" not in comments_df.columns:
+        return []
+
+    # Stopwords for filtering
+    stopwords = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+        "by", "from", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+        "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
+        "must", "shall", "can", "this", "that", "these", "those", "i", "you", "he", "she",
+        "it", "we", "they", "what", "which", "who", "whom", "when", "where", "why", "how",
+        "all", "each", "every", "both", "few", "more", "most", "other", "some", "such",
+        "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
+        "also", "now", "here", "there", "then", "if", "as", "any", "my", "your", "his",
+        "her", "its", "our", "their", "about", "up", "out", "into", "over", "after",
+        "before", "between", "under", "again", "further", "once", "during", "while",
+        "because", "although", "through", "until", "unless", "since", "even", "though",
+        "get", "got", "getting", "like", "one", "two", "first", "new", "way", "use",
+        "used", "using", "make", "made", "making", "know", "think", "see", "come",
+        "go", "going", "take", "want", "look", "give", "day", "good", "back", "much",
+        "well", "year", "work", "still", "right", "people", "thing", "things", "really",
+        "say", "said", "need", "try", "lot", "let", "something", "anything", "everything",
+        "nothing", "someone", "anyone", "everyone", "edit", "deleted", "removed", "http",
+        "https", "www", "com", "org", "amp", "reddit", "subreddit"
+    }
+
+    # Combine all comment bodies
+    all_text = " ".join(comments_df["body"].fillna("").astype(str).tolist())
+
+    # Tokenize and clean
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', all_text.lower())
+
+    # Filter stopwords and short words
+    brand_lower = primary_brand.lower()
+    filtered_words = [
+        w for w in words
+        if w not in stopwords
+        and len(w) >= 3
+        and not w.isdigit()
+    ]
+
+    # Count frequencies
+    word_counts = Counter(filtered_words)
+
+    # Convert to ECharts format
+    word_data = [
+        {"name": word, "value": count}
+        for word, count in word_counts.most_common(max_words)
+    ]
+
+    return word_data
+
+
+def display_word_cloud():
+    """Display interactive word cloud using ECharts."""
+    st.markdown("""
+    <div class="section-header">
+        <h2>☁️ Discussion Word Cloud</h2>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("Visualize the most frequently discussed topics in the analyzed comments.")
+
+    # Check if ECharts is available
+    if not ECHARTS_AVAILABLE:
+        st.warning("Word cloud requires streamlit-echarts. Install with: `pip install streamlit-echarts`")
+        return
+
+    comments_df = st.session_state.get("comments_df")
+    snapshot = st.session_state.get("snapshot")
+
+    if comments_df is None or comments_df.empty:
+        st.warning("No comment data available. Run an analysis first.")
+        return
+
+    # Get primary brand for context
+    primary_brand = ""
+    if snapshot and hasattr(snapshot, "primary_brand"):
+        primary_brand = snapshot.primary_brand
+
+    # Extract keywords
+    word_data = extract_keywords_from_comments(comments_df, primary_brand, max_words=80)
+
+    if not word_data:
+        st.info("Not enough text data to generate word cloud.")
+        return
+
+    # Display metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Unique Words", len(word_data))
+    with col2:
+        st.metric("Top Word", word_data[0]["name"] if word_data else "N/A")
+    with col3:
+        st.metric("Top Word Count", word_data[0]["value"] if word_data else 0)
+
+    # ECharts word cloud option
+    option = {
+        "tooltip": {
+            "show": True,
+            "formatter": "{b}: {c} mentions"
+        },
+        "series": [{
+            "type": "wordCloud",
+            "shape": "circle",
+            "keepAspect": False,
+            "left": "center",
+            "top": "center",
+            "width": "90%",
+            "height": "90%",
+            "right": None,
+            "bottom": None,
+            "sizeRange": [14, 60],
+            "rotationRange": [-45, 45],
+            "rotationStep": 15,
+            "gridSize": 8,
+            "drawOutOfBound": False,
+            "layoutAnimation": True,
+            "textStyle": {
+                "fontFamily": "sans-serif",
+                "fontWeight": "bold",
+                "color": "function () { return 'hsl(' + Math.random() * 360 + ', 70%, 50%)'; }"
+            },
+            "emphasis": {
+                "focus": "self",
+                "textStyle": {
+                    "textShadowBlur": 10,
+                    "textShadowColor": "#333"
+                }
+            },
+            "data": word_data
+        }]
+    }
+
+    # Render the word cloud
+    st_echarts(option, height="500px", key="wordcloud")
+
+    # Show top words table
+    with st.expander("📊 Top 20 Words"):
+        top_words_df = pd.DataFrame(word_data[:20])
+        top_words_df.columns = ["Word", "Mentions"]
+        top_words_df.index = range(1, len(top_words_df) + 1)
+        st.dataframe(top_words_df, use_container_width=True)
+
+    # Sentiment breakdown by top words
+    if "sentiment_label" in comments_df.columns:
+        with st.expander("🎭 Sentiment by Top Keywords"):
+            st.markdown("See how sentiment varies for comments containing top keywords:")
+
+            top_5_words = [w["name"] for w in word_data[:5]]
+            sentiment_by_word = []
+
+            for word in top_5_words:
+                mask = comments_df["body"].str.lower().str.contains(word, na=False)
+                word_comments = comments_df[mask]
+                if len(word_comments) > 0:
+                    pos = (word_comments["sentiment_label"] == "positive").sum()
+                    neu = (word_comments["sentiment_label"] == "neutral").sum()
+                    neg = (word_comments["sentiment_label"] == "negative").sum()
+                    total = len(word_comments)
+                    sentiment_by_word.append({
+                        "Word": word,
+                        "Positive %": round(pos / total * 100, 1),
+                        "Neutral %": round(neu / total * 100, 1),
+                        "Negative %": round(neg / total * 100, 1),
+                        "Total Mentions": total
+                    })
+
+            if sentiment_by_word:
+                st.dataframe(pd.DataFrame(sentiment_by_word), use_container_width=True)
 
 
 def display_shift_tracking():
@@ -1965,13 +2246,14 @@ if st.session_state.running:
 
 elif st.session_state.snapshot:
     # Create tabs for different views
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Analysis Results",
         "📄 Executive Report",
         "🚨 Response Queue",
         "💡 Opportunities",
         "🎯 Recommendations",
         "📈 KPI Dashboard",
+        "☁️ Word Cloud",
         "📉 Sentiment Shifts"
     ])
 
@@ -1994,6 +2276,9 @@ elif st.session_state.snapshot:
         display_kpi_dashboard()
 
     with tab7:
+        display_word_cloud()
+
+    with tab8:
         display_shift_tracking()
 
     # Save to BigQuery option
