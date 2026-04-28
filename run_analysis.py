@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from reddit_sentiment.data.collector import collect
 from reddit_sentiment.data.preprocess import apply_cleaning
-from reddit_sentiment.sentiment.hf_engine import HfEngine
+from reddit_sentiment.sentiment import analyze_toward_brand
 from reddit_sentiment.analytics.competitor_analyzer import CompetitorAnalyzer
 from reddit_sentiment.config.clients import get_registry, get_client, ClientConfig
 
@@ -99,24 +99,12 @@ def run_analysis(
     print(f'\n[2/{total_steps}] Applying text cleaning...')
     comments_df = apply_cleaning(comments_df)
 
-    print(f'\n[3/{total_steps}] Running sentiment analysis (HuggingFace 3-class)...')
-    engine = HfEngine()
-    sentiment_df = engine.run(comments_df['body'].tolist())
+    print(f'\n[3/{total_steps}] Running ABSA sentiment toward "{client_config.primary_brand}"...')
+    sentiment_df = analyze_toward_brand(comments_df['body'].tolist(), client_config.primary_brand)
 
-    # Convert 3-class sentiment (POSITIVE/NEUTRAL/NEGATIVE) to numeric score
-    def convert_to_score(row):
-        sentiment = row['sentiment']
-        confidence = float(row['prob']) if row['prob'] is not None else 0.5
-        confidence = max(0.0, min(1.0, confidence))
-
-        if sentiment == 'POSITIVE':
-            return confidence
-        elif sentiment == 'NEGATIVE':
-            return -confidence
-        else:  # NEUTRAL
-            return 0.0
-
-    comments_df['sentiment_score'] = sentiment_df.apply(convert_to_score, axis=1)
+    # ABSA provides brand_sentiment_score directly (-1 to +1)
+    comments_df['sentiment_score'] = sentiment_df['brand_sentiment_score']
+    comments_df['sentiment_label'] = sentiment_df['sentiment'].str.lower()
     # Use model's 3-class labels directly
     comments_df['sentiment_label'] = sentiment_df['sentiment'].str.lower()
 

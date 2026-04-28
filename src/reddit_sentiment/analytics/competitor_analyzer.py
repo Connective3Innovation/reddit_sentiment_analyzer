@@ -10,18 +10,30 @@ Supports multi-client configuration via ClientConfig.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, TYPE_CHECKING
+from typing import Final, Optional, TYPE_CHECKING
 from uuid import uuid4
 
 import pandas as pd
+
+_LOGGER: Final = logging.getLogger(__name__)
 
 from .models import CompetitorSnapshot, CompetitorAnalysis as CompetitorAnalysisModel
 
 if TYPE_CHECKING:
     from ..config.clients import ClientConfig
+
+# Try to import ABSA sentiment (optional - graceful fallback)
+try:
+    from ..sentiment import analyze_toward_brand
+    ABSA_AVAILABLE = True
+except ImportError:
+    ABSA_AVAILABLE = False
+    analyze_toward_brand = None  # type: ignore
 
 
 # Industry-specific topic patterns
@@ -176,6 +188,9 @@ class CompetitorAnalyzer:
             pattern = r'\b(' + '|'.join(re.escape(a) for a in aliases) + r')\b'
             self._patterns[name] = re.compile(pattern, re.IGNORECASE)
 
+        # Flag for ABSA sentiment
+        self._use_absa = ABSA_AVAILABLE
+
         # Comparison patterns
         self._better_pattern = re.compile(
             r'(better|superior|prefer|love|great|excellent|amazing|best|recommend)',
@@ -306,6 +321,38 @@ class CompetitorAnalyzer:
 
         return None
 
+    def _calculate_brand_sentiment(
+        self,
+        df: pd.DataFrame,
+        brand: str,
+        text_col: str = "body",
+    ) -> float:
+        """
+        Calculate ABSA sentiment toward a specific brand.
+
+        Returns average brand sentiment score (-1 to +1).
+        Falls back to generic sentiment if ABSA unavailable.
+        """
+        if not self._use_absa or analyze_toward_brand is None:
+            # Fallback: use generic sentiment filtered by brand mentions
+            return 0.0
+
+        if df.empty or text_col not in df.columns:
+            return 0.0
+
+        texts = df[text_col].fillna("").tolist()
+        if not texts:
+            return 0.0
+
+        try:
+            results = analyze_toward_brand(texts, brand)
+            if "brand_sentiment_score" in results.columns:
+                return float(results["brand_sentiment_score"].mean())
+            return 0.0
+        except Exception:
+            # Graceful fallback on any error
+            return 0.0
+
     def analyze_competitors(
         self,
         df: pd.DataFrame,
@@ -327,10 +374,22 @@ class CompetitorAnalyzer:
         Returns:
             CompetitorSnapshot for storage in BigQuery
         """
+        _LOGGER.info(
+            "COMPETITOR: Starting analysis - brand='%s', comments=%d, competitors=%d, industry=%s",
+            self.primary_brand, len(df), len(self.competitors), self.industry
+        )
+        analysis_start = time.time()
+
         now = datetime.now(timezone.utc)
 
         # Find all mentions
+        _LOGGER.info("COMPETITOR: Scanning for competitor mentions...")
+        mention_start = time.time()
         mentions = self.find_competitor_mentions(df, text_col)
+        _LOGGER.info(
+            "COMPETITOR: Found %d competitor mentions in %.2fs",
+            len(mentions), time.time() - mention_start
+        )
 
         # Group by competitor
         competitor_data: dict[str, list[CompetitorMention]] = {}
@@ -373,6 +432,25 @@ class CompetitorAnalyzer:
             subreddit_counts = pd.Series(subreddits).value_counts()
             top_subs = subreddit_counts.head(5).index.tolist()
 
+            # Prioritize sample mentions that compare competitor TO primary brand
+            # These provide better context for the analysis (not just general competitor comments)
+            primary_pattern = re.compile(
+                r'\b(' + '|'.join(re.escape(self.primary_brand)) + r')\b',
+                re.IGNORECASE
+            )
+            # Split mentions: those comparing to primary brand vs general competitor mentions
+            comparison_mentions = [m for m in comp_mentions if primary_pattern.search(m.body)]
+            other_mentions = [m for m in comp_mentions if not primary_pattern.search(m.body)]
+
+            # Prefer comparison mentions, fall back to general mentions
+            sorted_comparison = sorted(comparison_mentions, key=lambda m: abs(m.sentiment_score), reverse=True)
+            sorted_other = sorted(other_mentions, key=lambda m: abs(m.sentiment_score), reverse=True)
+
+            # Take comparison mentions first, then fill with other mentions
+            best_samples = sorted_comparison[:5]
+            if len(best_samples) < 5:
+                best_samples.extend(sorted_other[:5 - len(best_samples)])
+
             analysis = CompetitorAnalysisResult(
                 competitor=competitor,
                 mention_count=len(comp_mentions),
@@ -385,7 +463,7 @@ class CompetitorAnalyzer:
                 switch_to_count=switch_to,
                 switch_from_count=switch_from,
                 top_subreddits=top_subs,
-                sample_mentions=sorted(comp_mentions, key=lambda m: abs(m.sentiment_score), reverse=True)[:5],
+                sample_mentions=best_samples,
             )
             analyses.append(analysis)
 
@@ -394,14 +472,53 @@ class CompetitorAnalyzer:
         analyses = analyses[:top_n]
 
         # Calculate primary brand metrics
-        primary_sentiment = df["sentiment_score"].mean() if "sentiment_score" in df.columns else 0
+        # Note: sentiment_score now contains ABSA brand-directed sentiment from the pipeline
+        _LOGGER.info("COMPETITOR: Calculating primary brand metrics...")
         primary_volume = len(df)
 
+        # Use existing ABSA scores from pipeline (already brand-directed)
+        if "sentiment_score" in df.columns:
+            primary_brand_sentiment = float(df["sentiment_score"].mean())
+            _LOGGER.info(
+                "COMPETITOR: Using pipeline ABSA brand sentiment=%.3f",
+                primary_brand_sentiment
+            )
+        else:
+            # Fallback: run ABSA if sentiment_score not in DataFrame
+            _LOGGER.info("COMPETITOR: Running ABSA sentiment for primary brand '%s'...", self.primary_brand)
+            absa_start = time.time()
+            primary_brand_sentiment = self._calculate_brand_sentiment(df, self.primary_brand)
+            _LOGGER.info(
+                "COMPETITOR: ABSA primary brand sentiment=%.3f (took %.2fs)",
+                primary_brand_sentiment, time.time() - absa_start
+            )
+
+        # primary_sentiment = primary_brand_sentiment (now both use ABSA)
+        primary_sentiment = primary_brand_sentiment
+
         # Calculate sentiment distribution
-        if "sentiment_label" in df.columns:
-            pos_pct = (df["sentiment_label"] == "positive").sum() / len(df) * 100 if len(df) > 0 else 0
-            neu_pct = (df["sentiment_label"] == "neutral").sum() / len(df) * 100 if len(df) > 0 else 0
-            neg_pct = (df["sentiment_label"] == "negative").sum() / len(df) * 100 if len(df) > 0 else 0
+        # Ensure percentages sum to 100% by handling NaN and other labels
+        if "sentiment_label" in df.columns and len(df) > 0:
+            # Normalize labels to lowercase and fill NaN
+            labels = df["sentiment_label"].fillna("neutral").str.lower()
+            pos_count = (labels == "positive").sum()
+            neu_count = (labels == "neutral").sum()
+            neg_count = (labels == "negative").sum()
+            other_count = len(df) - pos_count - neu_count - neg_count
+
+            # If there are "other" labels (mixed, NaN, etc.), redistribute to neutral
+            # This ensures percentages always sum to 100%
+            if other_count > 0:
+                _LOGGER.debug(
+                    "COMPETITOR: %d comments with non-standard labels redistributed to neutral",
+                    other_count
+                )
+                neu_count += other_count
+
+            total = len(df)
+            pos_pct = pos_count / total * 100
+            neu_pct = neu_count / total * 100
+            neg_pct = neg_count / total * 100
         else:
             pos_pct = neu_pct = neg_pct = 0
 
@@ -437,12 +554,39 @@ class CompetitorAnalyzer:
         threats = self._identify_threats(analyses)
         opportunities = self._identify_opportunities(analyses)
 
+        # Calculate ABSA brand sentiment for each competitor
+        competitor_brand_sentiments = {}
+        if self._use_absa and analyses:
+            _LOGGER.info("COMPETITOR: Running ABSA sentiment for %d competitors...", len(analyses))
+            comp_absa_start = time.time()
+            for analysis in analyses:
+                # Get comments that mention this competitor
+                comp_comments = df[
+                    df["body"].str.lower().str.contains(
+                        "|".join(re.escape(a) for a in self.competitors.get(analysis.competitor, [analysis.competitor])),
+                        regex=True,
+                        na=False
+                    )
+                ]
+                if len(comp_comments) > 0:
+                    comp_score = self._calculate_brand_sentiment(comp_comments, analysis.competitor)
+                    competitor_brand_sentiments[analysis.competitor] = comp_score
+                    _LOGGER.debug(
+                        "COMPETITOR: ABSA for '%s' = %.3f (%d comments)",
+                        analysis.competitor, comp_score, len(comp_comments)
+                    )
+            _LOGGER.info(
+                "COMPETITOR: Competitor ABSA complete in %.2fs",
+                time.time() - comp_absa_start
+            )
+
         # Convert to Pydantic models for storage
         competitor_models = [
             CompetitorAnalysisModel(
                 competitor=a.competitor,
                 mention_count=a.mention_count,
                 avg_sentiment=a.avg_sentiment,
+                brand_sentiment_score=competitor_brand_sentiments.get(a.competitor, 0.0),
                 positive_mentions=a.positive_mentions,
                 negative_mentions=a.negative_mentions,
                 neutral_mentions=a.neutral_mentions,
@@ -456,6 +600,24 @@ class CompetitorAnalyzer:
             for a in analyses
         ]
 
+        total_elapsed = time.time() - analysis_start
+        _LOGGER.info(
+            "COMPETITOR: Analysis complete in %.2fs | "
+            "brand='%s' sentiment=%.3f (ABSA=%.3f) | "
+            "%d competitor mentions | %d threats, %d opportunities | %d pain points",
+            total_elapsed,
+            self.primary_brand, primary_sentiment, primary_brand_sentiment,
+            len(mentions), len(threats), len(opportunities), len(pain_points)
+        )
+
+        # Log top competitors
+        if competitor_models:
+            top_comp = competitor_models[0]
+            _LOGGER.info(
+                "COMPETITOR: Top competitor: '%s' (%d mentions, ABSA=%.3f)",
+                top_comp.competitor, top_comp.mention_count, top_comp.brand_sentiment_score
+            )
+
         return CompetitorSnapshot(
             snapshot_id=str(uuid4()),
             client_id=self.client_id,
@@ -467,6 +629,7 @@ class CompetitorAnalyzer:
             posts_analyzed=posts_analyzed,
             comments_analyzed=primary_volume,
             primary_sentiment=float(primary_sentiment),
+            primary_brand_sentiment=float(primary_brand_sentiment),
             primary_positive_pct=float(pos_pct),
             primary_neutral_pct=float(neu_pct),
             primary_negative_pct=float(neg_pct),
@@ -561,18 +724,23 @@ class CompetitorAnalyzer:
         threats = []
 
         for analysis in analyses:
-            # High switch-to rate is a threat
-            if analysis.switch_to_count > 2:
+            # Any switch-to mentions are notable (lowered from >2 to >0)
+            if analysis.switch_to_count > 0:
                 threats.append(
                     f"Users switching to {analysis.competitor} "
-                    f"({analysis.switch_to_count} mentions)"
+                    f"({analysis.switch_to_count} mention{'s' if analysis.switch_to_count > 1 else ''})"
                 )
 
-            # Competitor with better sentiment
-            if analysis.avg_sentiment > 0.3 and analysis.mention_count > 5:
+            # Competitor with positive sentiment (lowered thresholds)
+            if analysis.avg_sentiment > 0.1 and analysis.mention_count > 2:
                 if analysis.better_at:
                     threats.append(
                         f"{analysis.competitor} praised for: {', '.join(analysis.better_at[:3])}"
+                    )
+                elif analysis.positive_mentions > analysis.negative_mentions:
+                    threats.append(
+                        f"{analysis.competitor} has positive sentiment "
+                        f"({analysis.positive_mentions} positive vs {analysis.negative_mentions} negative)"
                     )
 
         return threats[:5]
@@ -582,19 +750,27 @@ class CompetitorAnalyzer:
         opportunities = []
 
         for analysis in analyses:
-            # Competitor weaknesses are our opportunities
-            if analysis.worse_at and analysis.avg_sentiment < 0:
+            # Competitor weaknesses are opportunities (even with neutral sentiment)
+            if analysis.worse_at:
                 opportunities.append(
                     f"Opportunity vs {analysis.competitor}: "
                     f"improve {', '.join(analysis.worse_at[:2])}"
                 )
 
-            # High switch-from rate means competitor losing customers
-            if analysis.switch_from_count > 2:
+            # Any switch-from mentions (lowered from >2 to >0)
+            if analysis.switch_from_count > 0:
                 opportunities.append(
                     f"Capture users leaving {analysis.competitor} "
-                    f"({analysis.switch_from_count} mentions)"
+                    f"({analysis.switch_from_count} mention{'s' if analysis.switch_from_count > 1 else ''})"
                 )
+
+            # Competitor with negative sentiment but no specific worse_at topics
+            if analysis.avg_sentiment < -0.1 and analysis.negative_mentions > analysis.positive_mentions:
+                if not analysis.worse_at:  # Only add if we didn't already add worse_at
+                    opportunities.append(
+                        f"{analysis.competitor} has negative sentiment "
+                        f"({analysis.negative_mentions} negative mentions)"
+                    )
 
         return opportunities[:5]
 

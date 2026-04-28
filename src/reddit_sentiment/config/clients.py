@@ -31,6 +31,8 @@ class ClientConfig:
     post_limit: int = 500
     enabled: bool = True
     metadata: dict = field(default_factory=dict)
+    target_subreddits: list[str] = field(default_factory=list)  # Subreddits to search (empty = all)
+    require_keyword_match: bool = True  # Filter posts that don't contain brand keywords
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,58 +96,224 @@ INDUSTRY_TEMPLATES = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Industry-specific subreddit targeting (reduces noise from irrelevant posts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+FINANCIAL_SUBREDDITS = [
+    "personalfinance",      # 19M members - credit cards, banking, general finance
+    "CreditCards",          # 750K members - primary credit card discussions
+    "churning",             # 400K members - credit card rewards optimization
+    "FinancialPlanning",    # 200K members - long-term financial decisions
+    "Banking",              # 150K members - bank comparisons
+    "CRedit",               # 100K members - credit building
+    "smallbusiness",        # 1.5M members - business credit cards
+    "Entrepreneur",         # 2M members - business banking
+    "povertyfinance",       # 1M members - budget banking
+    "fatFIRE",              # 500K members - premium cards
+]
+
+TECH_SUBREDDITS = [
+    "technology",
+    "programming",
+    "webdev",
+    "software",
+    "startups",
+    "SaaS",
+]
+
+RETAIL_SUBREDDITS = [
+    "Frugal",
+    "deals",
+    "shopping",
+    "Costco",
+    "Target",
+    "walmart",
+]
+
+INDUSTRY_SUBREDDITS = {
+    "financial_services": FINANCIAL_SUBREDDITS,
+    "tech": TECH_SUBREDDITS,
+    "retail": RETAIL_SUBREDDITS,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capital One Segment-Specific Subreddits
+# ─────────────────────────────────────────────────────────────────────────────
+
+CAPITAL_ONE_TECH_SUBREDDITS = [
+    # AI & Machine Learning
+    "MachineLearning",       # 3M+ - ML research and applications
+    "artificial",            # 1M+ - General AI discussions
+    "LocalLLaMA",            # 500K - LLM enthusiasts
+    "OpenAI",                # 1M+ - AI products and tools
+    "ChatGPT",               # 2M+ - AI users
+    # Data Science
+    "datascience",           # 1M - Data science professionals
+    "dataengineering",       # 200K - Data infrastructure
+    "analytics",             # 100K - Analytics professionals
+    "rstats",                # 100K - R/statistics users
+    # Software Development
+    "programming",           # 5M+ - General programming
+    "webdev",                # 2M - Web developers
+    "ExperiencedDevs",       # 200K - Senior engineers
+    "cscareerquestions",     # 1M+ - Tech career discussions
+    # Tech Finance (where tech workers discuss finances)
+    "personalfinance",       # 19M - Personal finance
+    "CreditCards",           # 750K - Credit card discussions
+    "fatFIRE",               # 500K - High earners (many in tech)
+]
+
+CAPITAL_ONE_B2B_SUBREDDITS = [
+    # Business subreddits
+    "smallbusiness",         # 1.5M - Small business owners
+    "Entrepreneur",          # 2M - Business founders
+    "startups",              # 1M - Startup founders
+    "ecommerce",             # 300K - Online business owners
+    "freelance",             # 200K - Freelancers need business accounts
+    "selfemployed",          # 100K - Self-employed
+    "accounting",            # 300K - Business finance
+    "sweatystartup",         # 200K - Service businesses
+    # Credit card subreddits (business cards discussed here too)
+    "CreditCards",           # 750K - Business card reviews/comparisons
+    "churning",              # 400K - Business card signup bonuses
+]
+
+CAPITAL_ONE_CONSUMER_SUBREDDITS = [
+    "personalfinance",       # 19M - Personal finance
+    "CreditCards",           # 750K - Credit card discussions
+    "churning",              # 400K - Rewards optimization
+    "povertyfinance",        # 1M - Budget-conscious
+    "FinancialPlanning",     # 200K - Long-term planning
+    "CRedit",                # 100K - Credit building
+    "fatFIRE",               # 500K - High-net-worth
+    "Frugal",                # 2M - Value-conscious consumers
+    "Banking",               # 150K - Bank comparisons
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Default client configurations
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CLIENTS: dict[str, ClientConfig] = {
-    "capital_one": ClientConfig(
-        client_id="capital_one",
-        client_name="Capital One",
+    # ─────────────────────────────────────────────────────────────────────────
+    # Capital One Segment Configs (3 focused segments instead of 1 general)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    "capital_one_tech": ClientConfig(
+        client_id="capital_one_tech",
+        client_name="Capital One (Technologists)",
         primary_brand="capital one",
         search_keywords=[
-            # Business credit cards
-            "capital one business credit card",
-            "capital one business card",
-            "capital one business credit cards",
-            "capital one credit card for small business",
-            "business credit card capital one",
-            "capital one credit card business",
-            "capital one credit card for business",
-            "capital one small business credit card",
-            "capital one small business credit cards",
-            "capital one credit cards for business",
-            "business credit cards capital one",
-            "capital one business rewards card",
-            "capital one credit card small business",
-            "capital one quicksilver business card",
-            "capital one spark business credit card",
-            "capital one venture business card",
-            # General credit cards
+            # General brand mentions in tech communities
+            "capital one",
             "capital one credit card",
-            "best capital one credit card",
-            "is capital one a good credit card",
-            "capital one 0 interest credit card",
-            "capital one no interest credit card",
-            "capital one credit card rewards",
-            "secured credit card capital one",
-            "credit card capital one",
-            # Popular products (high volume)
             "capital one venture",
+            "capital one savor",
+            "capital one quicksilver",
+            # Tech-specific financial needs
+            "capital one software subscription",
+            "capital one aws credits",
+            "capital one cloud spending",
+            "capital one tech purchases",
+            # Banking for tech workers
+            "capital one savings",
+            "capital one 360",
+            "capital one high yield",
+            # Rewards relevant to tech workers
+            "capital one travel rewards",
+            "capital one lounge",
+            "venture x lounge",
+        ],
+        competitors={
+            # Credit cards popular with tech workers
+            "chase sapphire": ["chase sapphire", "sapphire reserve", "sapphire preferred", "csr", "csp"],
+            "amex platinum": ["amex platinum", "amex plat", "platinum card"],
+            "amex gold": ["amex gold", "gold card"],
+            "citi": ["citi", "citi premier", "citi double cash"],
+            # Online banks popular with tech workers
+            "sofi": ["sofi", "social finance"],
+            "ally": ["ally bank", "ally"],
+            "marcus": ["marcus", "goldman marcus"],
+            "wealthfront": ["wealthfront"],
+            "betterment": ["betterment"],
+        },
+        industry="tech",
+        days_back=30,
+        post_limit=500,
+        target_subreddits=CAPITAL_ONE_TECH_SUBREDDITS,
+        require_keyword_match=True,
+    ),
+
+    "capital_one_b2b": ClientConfig(
+        client_id="capital_one_b2b",
+        client_name="Capital One (Business Banking)",
+        primary_brand="capital one",
+        search_keywords=[
+            # Business cards
+            "capital one spark",
+            "capital one spark business",
+            "capital one business card",
+            "capital one business credit card",
+            "capital one small business",
+            "spark cash",
+            "spark miles",
+            # Business banking
+            "capital one business checking",
+            "capital one business account",
+            "capital one merchant services",
+            "capital one business banking",
+            # Business credit
+            "capital one business line of credit",
+            "capital one business loan",
+        ],
+        competitors={
+            # Business credit cards
+            "chase ink": ["chase ink", "ink business", "ink preferred", "ink unlimited", "ink cash"],
+            "amex business": ["amex business", "business platinum", "business gold", "blue business", "amex biz"],
+            "bank of america": ["bofa business", "bank of america business", "boa business"],
+            # Startup/SMB cards
+            "brex": ["brex", "brex card", "brex cash"],
+            "ramp": ["ramp", "ramp card"],
+            "divvy": ["divvy", "divvy card", "bill divvy"],
+            # Business banking alternatives
+            "mercury": ["mercury", "mercury bank", "mercury business"],
+            "bluevine": ["bluevine", "blue vine", "bluevine business"],
+            "novo": ["novo", "novo bank", "novo business"],
+        },
+        industry="financial_services",
+        days_back=30,
+        post_limit=500,
+        target_subreddits=CAPITAL_ONE_B2B_SUBREDDITS,
+        require_keyword_match=True,
+    ),
+
+    "capital_one_consumer": ClientConfig(
+        client_id="capital_one_consumer",
+        client_name="Capital One (Consumer)",
+        primary_brand="capital one",
+        search_keywords=[
+            # Consumer credit cards
+            "capital one venture",
+            "capital one venture x",
             "capital one quicksilver",
             "capital one savor",
-            "capital one venture x",
+            "capital one savor one",
+            "capital one platinum",
+            "capital one secured",
+            # Banking products
             "capital one 360",
             "capital one savings",
             "capital one checking",
-            # Brand variations & discussions
-            "capitalone",
-            "cap one card",
+            "capital one high yield",
+            # General consumer
+            "capital one credit card",
             "capital one rewards",
             "capital one approval",
+            "capital one credit limit",
             "capital one customer service",
         ],
-        # Use industry competitors for regex-based threat/opportunity detection
-        # LLM analysis still identifies competitors naturally from text
         competitors={
             k: v for k, v in FINANCIAL_SERVICES_COMPETITORS.items()
             if k.lower() != "capital one"
@@ -153,6 +321,8 @@ DEFAULT_CLIENTS: dict[str, ClientConfig] = {
         industry="financial_services",
         days_back=30,
         post_limit=500,
+        target_subreddits=CAPITAL_ONE_CONSUMER_SUBREDDITS,
+        require_keyword_match=True,
     ),
 }
 
@@ -185,17 +355,23 @@ class ClientRegistry:
             data = json.load(f)
 
         for client_data in data.get("clients", []):
+            # Get industry subreddits if not specified
+            industry = client_data.get("industry", "general")
+            default_subreddits = INDUSTRY_SUBREDDITS.get(industry, [])
+
             client = ClientConfig(
                 client_id=client_data["client_id"],
                 client_name=client_data["client_name"],
                 primary_brand=client_data["primary_brand"],
                 search_keywords=client_data.get("search_keywords", [client_data["primary_brand"]]),
                 competitors=client_data.get("competitors", {}),
-                industry=client_data.get("industry", "general"),
+                industry=industry,
                 days_back=client_data.get("days_back", 30),
                 post_limit=client_data.get("post_limit", 500),
                 enabled=client_data.get("enabled", True),
                 metadata=client_data.get("metadata", {}),
+                target_subreddits=client_data.get("target_subreddits", default_subreddits),
+                require_keyword_match=client_data.get("require_keyword_match", True),
             )
             self._clients[client.client_id] = client
 
@@ -258,6 +434,8 @@ class ClientRegistry:
             search_keywords=[primary_brand],
             competitors=competitors,
             industry=industry,
+            target_subreddits=INDUSTRY_SUBREDDITS.get(industry, []),
+            require_keyword_match=True,
         )
 
         self.add_client(config)

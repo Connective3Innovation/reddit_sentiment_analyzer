@@ -11,6 +11,7 @@ __pycache__/
 
 # Data
 /data/
+/raw_data_export/
 *.parquet
 
 # Scripts (local analysis)
@@ -22,3 +23,13 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+# Claude Code
+.claude/
+
+# Notebooks (local analysis)
+/notebooks/
+
+# Misc artifacts
+nul
+=1.3

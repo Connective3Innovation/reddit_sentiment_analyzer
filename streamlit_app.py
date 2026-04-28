@@ -6,7 +6,35 @@ Run with: streamlit run streamlit_app.py
 
 import os
 import sys
+import logging
 from pathlib import Path
+
+# Configure logging to show in terminal with detailed output
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)-40s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,  # Override any existing config
+)
+
+# Enable detailed logs from all our modules
+_log_modules = [
+    "reddit_sentiment",
+    "reddit_sentiment.data.collector",
+    "reddit_sentiment.data.preprocess",
+    "reddit_sentiment.api.reddit_client",
+    "reddit_sentiment.sentiment.hf_engine",
+    "reddit_sentiment.sentiment.absa_engine",
+    "reddit_sentiment.analytics.competitor_analyzer",
+    "reddit_sentiment.llm.openrouter_client",
+]
+for mod in _log_modules:
+    logging.getLogger(mod).setLevel(logging.INFO)
+
+# Set DEBUG level for detailed API/model logs
+logging.getLogger("reddit_sentiment.api.reddit_client").setLevel(logging.DEBUG)
+logging.getLogger("reddit_sentiment.sentiment.absa_engine").setLevel(logging.DEBUG)
 
 # Add src directory to Python path for module imports
 src_path = Path(__file__).parent / "src"
@@ -38,6 +66,9 @@ import numpy as np
 from datetime import datetime, timezone
 import re
 from collections import Counter
+
+# Deck export for presentation-ready data
+from reddit_sentiment.export import create_deck_export_zip
 
 # Optional: ECharts for word cloud (graceful fallback if not installed)
 try:
@@ -334,9 +365,21 @@ if "llm_error" not in st.session_state:
 
 def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=False, max_keywords=5):
     """Run the analysis pipeline."""
+    import time
+    pipeline_start = time.time()
+    _logger = logging.getLogger("streamlit_app")
+
+    _logger.info("=" * 80)
+    _logger.info("PIPELINE: Starting analysis for client='%s'", client_config.client_id)
+    _logger.info("PIPELINE: brand='%s', days=%d, limit=%d, llm=%s",
+                 client_config.primary_brand, days_back, post_limit, run_llm)
+    _logger.info("PIPELINE: subreddits=%s",
+                 client_config.target_subreddits[:5] if client_config.target_subreddits else "all")
+    _logger.info("=" * 80)
+
     from reddit_sentiment.data.collector import collect
     from reddit_sentiment.data.preprocess import apply_cleaning
-    from reddit_sentiment.sentiment.hf_engine import HfEngine
+    from reddit_sentiment.sentiment import analyze_toward_brand
     from reddit_sentiment.analytics.competitor_analyzer import CompetitorAnalyzer
     from reddit_sentiment.analytics.opportunity_scorer import OpportunityScorer
 
@@ -358,74 +401,117 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
         all_comments = []
         keywords_to_search = client_config.search_keywords[:max_keywords]
 
+        # Get brand terms for filtering
+        brand_terms = [client_config.primary_brand.lower()]
+        # Add common aliases
+        if "capital one" in client_config.primary_brand.lower():
+            brand_terms.extend(["capitalone", "cap one"])
+
         for i, kw in enumerate(keywords_to_search):
             # Scale progress dynamically: 5% to 25% across all keywords
             search_progress = int(5 + (i + 1) / len(keywords_to_search) * 20)
+            # Build search query first for debug output
+            primary = client_config.primary_brand.lower()
+            if kw.lower().startswith(primary) and len(kw) > len(primary):
+                modifier = kw[len(primary):].strip()
+                search_kw = f'"{primary}" {modifier}'
+            else:
+                search_kw = f'"{kw}"'
+            print(f"[DEBUG] Searching keyword {i+1}/{len(keywords_to_search)}: '{kw}' → query: {search_kw}", flush=True)
             progress.progress(
                 search_progress,
                 text=f"Searching for '{kw}' ({i+1}/{len(keywords_to_search)})..."
             )
             try:
-                posts, comments = collect(f'"{kw}"', limit=post_limit // len(keywords_to_search), days_back=days_back)
+                posts, comments = collect(
+                    search_kw,
+                    limit=post_limit // len(keywords_to_search),
+                    days_back=days_back,
+                    subreddits=client_config.target_subreddits,  # Target finance subreddits
+                    brand_terms=brand_terms,  # Filter out noise
+                    require_keyword_match=client_config.require_keyword_match,
+                )
+                print(f"[DEBUG] Keyword '{kw}': {len(posts)} posts, {len(comments)} comments", flush=True)
                 all_posts.append(posts)
                 all_comments.append(comments)
             except Exception as e:
+                print(f"[DEBUG] Keyword '{kw}' FAILED: {e}", flush=True)
                 st.warning(f"Search for '{kw}' failed: {e}")
 
         # Combine and deduplicate
+        print(f"[DEBUG] Collection done. Combining {len(all_posts)} DataFrames...", flush=True)
         if all_posts:
             posts_df = pd.concat(all_posts, ignore_index=True).drop_duplicates(subset=["id"])
             comments_df = pd.concat(all_comments, ignore_index=True).drop_duplicates(subset=["comment_id"])
+            print(f"[DEBUG] Combined: {len(posts_df)} posts, {len(comments_df)} comments", flush=True)
         else:
             posts_df, comments_df = pd.DataFrame(), pd.DataFrame()
+            print("[DEBUG] No posts found!", flush=True)
     else:
         # Simple search: just brand name
         search_query = f'"{client_config.primary_brand}"'
         progress.progress(10, text=f"Collecting Reddit data for {search_query}...")
-        posts_df, comments_df = collect(search_query, limit=post_limit, days_back=days_back)
+
+        # Get brand terms for filtering
+        brand_terms = [client_config.primary_brand.lower()]
+        if "capital one" in client_config.primary_brand.lower():
+            brand_terms.extend(["capitalone", "cap one"])
+
+        posts_df, comments_df = collect(
+            search_query,
+            limit=post_limit,
+            days_back=days_back,
+            subreddits=client_config.target_subreddits,
+            brand_terms=brand_terms,
+            require_keyword_match=client_config.require_keyword_match,
+        )
+
+    _logger.info("PIPELINE: Data collection complete - %d posts, %d comments", len(posts_df), len(comments_df))
 
     if len(comments_df) == 0:
-        st.error("No comments found!")
+        _logger.warning("PIPELINE: No comments found - aborting analysis")
+        st.error("No comments found! Try different keywords or increase the date range.")
         return None
 
     st.info(f"Found {len(posts_df)} posts and {len(comments_df)} comments")
 
     # Step 2: Clean text
+    _logger.info("PIPELINE: Step 2 - Text preprocessing")
+    step_start = time.time()
     progress.progress(30, text="Cleaning text...")
     comments_df = apply_cleaning(comments_df)
+    _logger.info("PIPELINE: Text cleaning complete in %.2fs", time.time() - step_start)
 
-    # Step 3: Sentiment analysis (using 3-class model: positive/neutral/negative)
-    progress.progress(50, text="Running HuggingFace sentiment analysis...")
-    engine = HfEngine()
-    sentiment_df = engine.run(comments_df["body"].tolist())
+    # Step 3: Sentiment analysis using ABSA (brand-directed sentiment)
+    _logger.info("PIPELINE: Step 3 - ABSA brand sentiment analysis (%d comments) toward '%s'",
+                 len(comments_df), client_config.primary_brand)
+    step_start = time.time()
+    progress.progress(50, text=f"Running ABSA sentiment toward {client_config.primary_brand}...")
+    sentiment_df = analyze_toward_brand(comments_df["body"].tolist(), client_config.primary_brand)
+    _logger.info("PIPELINE: Sentiment analysis complete in %.2fs", time.time() - step_start)
 
-    def convert_to_score(row):
-        """Convert 3-class sentiment to numeric score.
-
-        POSITIVE → +confidence (0 to +1)
-        NEUTRAL  → 0 (no strong sentiment)
-        NEGATIVE → -confidence (0 to -1)
-        """
-        sentiment = row["sentiment"]
-        confidence = float(row["prob"]) if row["prob"] is not None else 0.5
-        confidence = max(0.0, min(1.0, confidence))
-
-        if sentiment == "POSITIVE":
-            return confidence
-        elif sentiment == "NEGATIVE":
-            return -confidence
-        else:  # NEUTRAL
-            return 0.0
-
-    comments_df["sentiment_score"] = sentiment_df.apply(convert_to_score, axis=1)
-    # Use model's 3-class labels directly, with fallback to score-based
+    # ABSA provides brand_sentiment_score directly (-1 to +1)
+    comments_df["sentiment_score"] = sentiment_df["brand_sentiment_score"]
     comments_df["sentiment_label"] = sentiment_df["sentiment"].str.lower()
+
+    # Log sentiment distribution
+    pos_count = (comments_df["sentiment_label"] == "positive").sum()
+    neg_count = (comments_df["sentiment_label"] == "negative").sum()
+    neu_count = (comments_df["sentiment_label"] == "neutral").sum()
+    _logger.info(
+        "PIPELINE: Sentiment distribution - POSITIVE=%d (%.1f%%) NEUTRAL=%d (%.1f%%) NEGATIVE=%d (%.1f%%)",
+        pos_count, 100 * pos_count / len(comments_df),
+        neu_count, 100 * neu_count / len(comments_df),
+        neg_count, 100 * neg_count / len(comments_df),
+    )
 
     # Store dataframes for other analyses
     st.session_state.posts_df = posts_df
     st.session_state.comments_df = comments_df
 
     # Step 4: Competitor analysis
+    _logger.info("PIPELINE: Step 4 - Competitor analysis (with ABSA brand sentiment)")
+    step_start = time.time()
     progress.progress(70, text="Analyzing competitor mentions...")
     analyzer = CompetitorAnalyzer(client_config=client_config)
     snapshot = analyzer.analyze_competitors(
@@ -433,8 +519,11 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
         period_days=days_back,
         posts_analyzed=len(posts_df),
     )
+    _logger.info("PIPELINE: Competitor analysis complete in %.2fs", time.time() - step_start)
 
     # Step 5: Content Opportunity Scoring
+    _logger.info("PIPELINE: Step 5 - Content opportunity scoring")
+    step_start = time.time()
     progress.progress(80, text="Scoring content opportunities...")
     try:
         scorer = OpportunityScorer()
@@ -442,17 +531,37 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
             posts_df, comments_df, client_config.primary_brand
         )
         st.session_state.opportunities = opportunities
+        _logger.info("PIPELINE: Found %d content opportunities", len(opportunities))
     except Exception as e:
+        _logger.warning("PIPELINE: Opportunity scoring failed: %s", e)
         st.warning(f"Opportunity scoring failed: {e}")
         st.session_state.opportunities = []
 
     # Step 6: Calculate KPI Metrics
+    _logger.info("PIPELINE: Step 6 - KPI metrics calculation")
     st.session_state.kpi_metrics = calculate_kpis(posts_df, comments_df, snapshot)
 
     # Step 7: LLM analysis (optional)
     if run_llm:
+        _logger.info("PIPELINE: Step 7 - LLM deep analysis (OpenRouter)")
+        step_start = time.time()
         progress.progress(90, text="Running LLM deep analysis...")
         snapshot = run_llm_analysis(snapshot, comments_df, client_config)
+        _logger.info("PIPELINE: LLM analysis complete in %.2fs", time.time() - step_start)
+    else:
+        _logger.info("PIPELINE: Step 7 - LLM analysis skipped (disabled)")
+
+    total_elapsed = time.time() - pipeline_start
+    _logger.info("=" * 80)
+    _logger.info("PIPELINE: COMPLETE in %.2fs", total_elapsed)
+    _logger.info(
+        "PIPELINE: Results - brand_sentiment=%.3f, %d competitor mentions, %d threats, %d opportunities",
+        snapshot.primary_brand_sentiment,
+        snapshot.total_competitor_mentions,
+        len(snapshot.threats),
+        len(snapshot.opportunities),
+    )
+    _logger.info("=" * 80)
 
     progress.progress(100, text="Analysis complete!")
     return snapshot
@@ -461,6 +570,9 @@ def run_analysis(client_config, days_back, post_limit, run_llm, detailed_search=
 def run_llm_analysis(snapshot, comments_df, client_config):
     """Run LLM deep analysis."""
     import traceback
+    import time
+    _logger = logging.getLogger("streamlit_app")
+    _logger.info("LLM_ANALYSIS: Starting deep analysis...")
 
     # Clear previous debug/error state
     st.session_state.llm_debug = {}
@@ -469,12 +581,14 @@ def run_llm_analysis(snapshot, comments_df, client_config):
     try:
         from reddit_sentiment.llm.openrouter_client import OpenRouterClient
     except ImportError as e:
+        _logger.error("LLM_ANALYSIS: Module import failed: %s", e)
         st.session_state.llm_error = f"LLM module not available: {e}"
         st.warning(st.session_state.llm_error)
         return snapshot
 
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
+        _logger.warning("LLM_ANALYSIS: OPENROUTER_API_KEY not set")
         st.session_state.llm_error = "OPENROUTER_API_KEY not set"
         st.warning(st.session_state.llm_error)
         return snapshot
@@ -562,14 +676,23 @@ def run_llm_analysis(snapshot, comments_df, client_config):
             st.session_state.llm_verified_pain_points = verified_pain_points
             st.session_state.llm_debug["verified_pain_points"] = len(verified_pain_points)
 
+        # Cluster topics from stratified sampling
+        cluster_topics = result.get("cluster_topics", [])
+        if cluster_topics:
+            st.session_state.cluster_topics = cluster_topics
+            st.session_state.llm_debug["cluster_topics"] = cluster_topics
+
     # Summary
     cache_status = "📦 cached" if st.session_state.llm_debug.get("cache_hit") else "🔄 fresh"
     themes_count = len(snapshot.llm_themes or [])
-    opps_count = len(result.get("content_opportunities", []))
+    llm_opps_count = len(result.get("content_opportunities", []))
+    ci_opps_count = len(snapshot.opportunities or [])
+    llm_pains_count = len(result.get("verified_pain_points", []))
+    rule_pains_count = len(snapshot.top_pain_points or [])
     recs_count = len(snapshot.llm_recommendations or [])
 
     st.success(f"✅ LLM analysis complete ({cache_status}) | "
-              f"{themes_count} themes, {opps_count} opportunities, {recs_count} recommendations")
+              f"{themes_count} themes, {llm_opps_count}+{ci_opps_count} opportunities, {llm_pains_count}+{rule_pains_count} pain points, {recs_count} recommendations")
 
     if snapshot.llm_executive_summary:
         st.success("✅ Executive summary generated")
@@ -631,17 +754,34 @@ def calculate_kpis(posts_df, comments_df, snapshot):
 
     # Health score (composite)
     # Clamp each component to 0-1 range before combining
+
+    # Positive sentiment % (0-100 mapped to 0-1)
     positive_component = min(max(kpis["sentiment_positive_pct"] / 100, 0), 1)
+
+    # Brand sentiment score (-1 to +1 mapped to 0-1)
+    # This is the ABSA score - more meaningful than just % positive
+    brand_score = snapshot.primary_brand_sentiment  # -1 to +1
+    brand_component = min(max((brand_score + 1) / 2, 0), 1)  # Map to 0-1
+
+    # Author diversity
     diversity_component = min(max(kpis["author_diversity"], 0), 1)
-    engagement_component = min(kpis["comments_per_post"] / 10, 1)
+
+    # Engagement: use 50 comments/post as the threshold (more realistic)
+    engagement_component = min(kpis["comments_per_post"] / 50, 1)
+
     # Volatility: std dev can exceed 1, so clamp (1 - volatility) to 0-1
     stability_component = min(max(1 - kpis["sentiment_volatility"], 0), 1)
 
+    # Store components for display
+    kpis["brand_sentiment_component"] = brand_component
+    kpis["engagement_raw"] = kpis["comments_per_post"]
+
     health_score = (
-        positive_component * 0.4  # 40% weight on positive sentiment
-        + diversity_component * 0.2  # 20% weight on author diversity
-        + engagement_component * 0.2  # 20% weight on engagement
-        + stability_component * 0.2  # 20% weight on stability
+        brand_component * 0.35  # 35% weight on ABSA brand sentiment (most important)
+        + positive_component * 0.25  # 25% weight on positive % distribution
+        + diversity_component * 0.15  # 15% weight on author diversity
+        + engagement_component * 0.15  # 15% weight on engagement
+        + stability_component * 0.10  # 10% weight on stability
     )
     kpis["health_score"] = min(max(health_score, 0), 1)  # Final clamp 0-1
 
@@ -809,8 +949,9 @@ def display_results(snapshot):
                     st.error(f"❌ Criticized for: {', '.join(comp.worse_at)}")
 
                 if comp.sample_mentions:
-                    st.write("**Sample mention:**")
-                    st.caption(comp.sample_mentions[0][:300] + "..." if len(comp.sample_mentions[0]) > 300 else comp.sample_mentions[0])
+                    st.write("**Sample mention (in context of Capital One discussion):**")
+                    mention_text = comp.sample_mentions[0][:300] + "..." if len(comp.sample_mentions[0]) > 300 else comp.sample_mentions[0]
+                    st.caption(f"_{mention_text}_")
 
     # Threats & Opportunities
     col1, col2 = st.columns(2)
@@ -830,30 +971,65 @@ def display_results(snapshot):
         else:
             st.info("No immediate opportunities identified")
 
-    # Pain Points - prefer LLM-verified over rule-based
+    # Pain Points - show both rule-based and LLM-verified
     st.subheader("😤 Top Pain Points")
+
+    # Rule-based pain points (from negative comment analysis)
+    if snapshot.top_pain_points:
+        st.caption("📊 From negative comments:")
+        for i, pain in enumerate(snapshot.top_pain_points, 1):
+            st.error(f"{i}. {pain}")
+
+    # LLM-verified pain points (more detailed with quotes)
     llm_pain_points = st.session_state.get("llm_verified_pain_points", [])
     if llm_pain_points:
-        # Show LLM-verified pain points (more accurate)
+        if snapshot.top_pain_points:
+            st.divider()
+        st.caption("🤖 LLM-verified (with evidence):")
         for i, pain in enumerate(llm_pain_points, 1):
             if isinstance(pain, dict):
                 issue = pain.get("issue", "")
                 severity = pain.get("severity", "medium")
-                quote = pain.get("sample_quote", "")
+                frequency = pain.get("frequency", "")
+                business_impact = pain.get("business_impact", "")
+
+                # Support both old format (sample_quote) and new format (evidence_quotes)
+                evidence_quotes = pain.get("evidence_quotes", [])
+                if not evidence_quotes and pain.get("sample_quote"):
+                    evidence_quotes = [pain.get("sample_quote")]
+
                 severity_color = {"high": "#dc2626", "medium": "#f59e0b", "low": "#6b7280"}.get(severity, "#f59e0b")
-                st.markdown(f"""
-                <div style="background: #fef2f2; border-left: 4px solid {severity_color}; padding: 0.75rem 1rem; margin-bottom: 0.5rem; border-radius: 0 8px 8px 0;">
-                    <strong>{i}. {issue}</strong>
-                    {f'<br><em style="color: #666;">"{quote[:150]}..."</em>' if quote else ''}
-                </div>
-                """, unsafe_allow_html=True)
+                severity_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(severity, "🟡")
+
+                with st.expander(f"{severity_emoji} **{i}. {issue}**", expanded=(i <= 2)):
+                    # Metadata row
+                    cols = st.columns(3)
+                    with cols[0]:
+                        st.caption(f"**Severity:** {severity.upper()}")
+                    with cols[1]:
+                        if frequency:
+                            st.caption(f"**Frequency:** {frequency}")
+                    with cols[2]:
+                        st.caption(f"**Evidence:** {len(evidence_quotes)} quote(s)")
+
+                    # Business impact
+                    if business_impact:
+                        st.info(f"💼 **Impact:** {business_impact}")
+
+                    # Evidence quotes
+                    if evidence_quotes:
+                        st.markdown("**📝 User Comments:**")
+                        for j, quote in enumerate(evidence_quotes, 1):
+                            if quote:
+                                st.markdown(f"""
+                                <div style="background: #f8fafc; border-left: 3px solid {severity_color}; padding: 0.5rem 0.75rem; margin: 0.5rem 0; border-radius: 0 6px 6px 0; font-style: italic; color: #475569;">
+                                    "{quote[:300]}{'...' if len(quote) > 300 else ''}"
+                                </div>
+                                """, unsafe_allow_html=True)
             else:
                 st.error(f"{i}. {pain}")
-    elif snapshot.top_pain_points:
-        # Fallback to rule-based pain points
-        for i, pain in enumerate(snapshot.top_pain_points, 1):
-            st.error(f"{i}. {pain}")
-    else:
+
+    if not snapshot.top_pain_points and not llm_pain_points:
         st.info("No significant pain points found")
 
     # LLM Deep Analysis
@@ -870,6 +1046,10 @@ def display_results(snapshot):
             <p style="color: #334155; font-size: 1rem; line-height: 1.6; margin: 0;">{snapshot.llm_executive_summary}</p>
         </div>
         """, unsafe_allow_html=True)
+
+        # NOTE: Raw cluster topics removed - using LLM-generated key_themes instead
+        # The raw TF-IDF bigrams (e.g., "000 miles & 70 000") are not client-ready
+        # LLM key_themes provide cleaner, more meaningful topic labels
 
         # Brand Perception (new)
         if hasattr(snapshot, 'llm_brand_perception') and snapshot.llm_brand_perception:
@@ -970,6 +1150,16 @@ def display_opportunities():
     </div>
     """, unsafe_allow_html=True)
     st.markdown("High-interest topics with untapped potential based on engagement and LLM analysis.")
+
+    # Competitive Intelligence Opportunities (from CompetitorAnalyzer)
+    snapshot = st.session_state.snapshot
+    ci_opps = snapshot.opportunities if snapshot else []
+    if ci_opps:
+        st.subheader("📈 Competitive Intelligence Opportunities")
+        st.caption("Based on competitor weaknesses and market gaps")
+        for i, opp in enumerate(ci_opps, 1):
+            st.success(f"**{i}.** {opp}")
+        st.divider()
 
     # LLM-Identified Opportunities (primary)
     llm_opps = st.session_state.llm_opportunities
@@ -1076,7 +1266,7 @@ def display_opportunities():
 
             st.info("Enable LLM analysis to identify specific content opportunities from this data.")
 
-    if not llm_opps and not opportunities:
+    if not llm_opps and not opportunities and not ci_opps:
         st.info("No content opportunities identified. Enable LLM analysis for better results.")
 
         # Show debug info if LLM was attempted
@@ -1130,7 +1320,14 @@ def display_kpi_dashboard():
     # Health Score - Visual Badge
     health = kpis.get("health_score", 0)
     health_class = "health-good" if health >= 0.7 else "health-warning" if health >= 0.4 else "health-critical"
-    health_label = "Healthy" if health >= 0.7 else "Needs Attention" if health >= 0.4 else "Critical"
+    # Use more contextual labels - avoid alarming "Critical" without context
+    health_label = "Above Average" if health >= 0.7 else "Average" if health >= 0.4 else "Below Average"
+
+    # Industry benchmarks for context (based on typical Reddit financial services discussions)
+    # Reddit skews negative for financial services - complaints drive engagement
+    INDUSTRY_BENCHMARK_LOW = 0.30   # Bottom quartile
+    INDUSTRY_BENCHMARK_MID = 0.45   # Median for financial services
+    INDUSTRY_BENCHMARK_HIGH = 0.60  # Top quartile
 
     col_health, col_details = st.columns([1, 2])
 
@@ -1144,23 +1341,64 @@ def display_kpi_dashboard():
         </div>
         """, unsafe_allow_html=True)
 
+        # Add benchmark context
+        benchmark_comparison = ""
+        if health >= INDUSTRY_BENCHMARK_HIGH:
+            benchmark_comparison = "Above industry average"
+        elif health >= INDUSTRY_BENCHMARK_MID:
+            benchmark_comparison = "At industry average"
+        elif health >= INDUSTRY_BENCHMARK_LOW:
+            benchmark_comparison = "Below industry average"
+        else:
+            benchmark_comparison = "Needs improvement"
+
+        st.markdown(f"""
+        <div style="text-align: center; font-size: 0.85rem; color: #64748b; margin-top: 0.5rem;">
+            <div style="margin-bottom: 0.25rem;">📊 {benchmark_comparison}</div>
+            <div style="font-size: 0.75rem;">Industry range: {INDUSTRY_BENCHMARK_LOW:.0%} - {INDUSTRY_BENCHMARK_HIGH:.0%}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     with col_details:
         st.markdown("#### Health Score Components")
+
+        # Row 1: Brand sentiment (most important) + Positive %
         cols = st.columns(2)
         with cols[0]:
-            st.markdown(f"**Positive Sentiment:** {kpis.get('sentiment_positive_pct', 0):.1f}% (40% weight)")
+            brand_comp = kpis.get('brand_sentiment_component', 0.5)
+            st.markdown(f"**🎯 Brand Sentiment:** {brand_comp:.0%} (35% weight)")
+            st.progress(brand_comp)
+        with cols[1]:
+            st.markdown(f"**😊 Positive %:** {kpis.get('sentiment_positive_pct', 0):.1f}% (25% weight)")
             st.progress(kpis.get('sentiment_positive_pct', 0) / 100)
-        with cols[1]:
-            st.markdown(f"**Author Diversity:** {kpis.get('author_diversity', 0):.0%} (20% weight)")
+
+        # Row 2: Diversity + Engagement
+        cols2 = st.columns(2)
+        with cols2[0]:
+            st.markdown(f"**👥 Author Diversity:** {kpis.get('author_diversity', 0):.0%} (15% weight)")
             st.progress(kpis.get('author_diversity', 0))
-        with cols[0]:
-            engagement = min(kpis.get('comments_per_post', 0) / 10, 1)
-            st.markdown(f"**Engagement:** {engagement:.0%} (20% weight)")
+        with cols2[1]:
+            engagement = min(kpis.get('comments_per_post', 0) / 50, 1)
+            cpr = kpis.get('comments_per_post', 0)
+            st.markdown(f"**💬 Engagement:** {engagement:.0%} ({cpr:.0f}/post, 15% weight)")
             st.progress(engagement)
-        with cols[1]:
-            stability = 1 - kpis.get('sentiment_volatility', 0)
-            st.markdown(f"**Stability:** {stability:.0%} (20% weight)")
-            st.progress(max(0, stability))
+
+        # Row 3: Stability
+        cols3 = st.columns(2)
+        with cols3[0]:
+            stability = max(0, 1 - kpis.get('sentiment_volatility', 0))
+            st.markdown(f"**📈 Stability:** {stability:.0%} (10% weight)")
+            st.progress(stability)
+
+        # Context note about Reddit sentiment for financial services
+        st.markdown("""
+        <div style="background: #f8fafc; border-radius: 8px; padding: 0.75rem; margin-top: 1rem; font-size: 0.8rem; color: #64748b;">
+            <strong>📌 Context:</strong> Reddit sentiment for financial services typically skews negative
+            (users come to Reddit to seek help with problems or vent frustrations).
+            A 30-45% health score is typical for the industry. Scores above 50% indicate
+            strong brand perception relative to peers.
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 
@@ -1382,11 +1620,24 @@ def display_response_queue():
         st.warning("Required columns (sentiment_score, score) not available.")
         return
 
-    # Filter to negative comments only
+    # Filter to negative comments that mention the brand
     negative_df = df[df["sentiment_label"] == "negative"].copy()
 
+    # Get brand terms from client config
+    brand_terms = ["capital one", "capitalone", "cap one"]
+    snapshot = st.session_state.snapshot
+    if snapshot and snapshot.primary_brand:
+        brand = snapshot.primary_brand.lower()
+        brand_terms = [brand, brand.replace(" ", "")]
+
+    # Filter to comments that actually mention the brand
+    brand_pattern = "|".join(brand_terms)
+    negative_df = negative_df[
+        negative_df["body"].str.lower().str.contains(brand_pattern, regex=True, na=False)
+    ]
+
     if negative_df.empty:
-        st.success("No negative posts requiring attention!")
+        st.success("No negative posts mentioning your brand that need attention!")
         return
 
     # Calculate attention priority score
@@ -1735,14 +1986,26 @@ def display_executive_report(snapshot, client_config):
             if isinstance(pain, dict):
                 issue = pain.get("issue", "")
                 severity = pain.get("severity", "medium")
-                quote = pain.get("sample_quote", "")
+                frequency = pain.get("frequency", "")
                 impact = pain.get("business_impact", "")
+
+                # Support both old format (sample_quote) and new format (evidence_quotes)
+                evidence_quotes = pain.get("evidence_quotes", [])
+                if not evidence_quotes and pain.get("sample_quote"):
+                    evidence_quotes = [pain.get("sample_quote")]
+
                 severity_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(severity, "🟡")
                 st.markdown(f"{severity_icon} **{issue}**")
-                if quote:
-                    st.caption(f'"{quote[:200]}..."')
+                if frequency:
+                    st.caption(f"Frequency: {frequency}")
                 if impact:
-                    st.caption(f"Impact: {impact}")
+                    st.caption(f"💼 Impact: {impact}")
+
+                # Show all evidence quotes
+                if evidence_quotes:
+                    for quote in evidence_quotes[:3]:  # Limit to 3 in exec report
+                        if quote:
+                            st.markdown(f'> *"{quote[:200]}{"..." if len(quote) > 200 else ""}"*')
             else:
                 st.error(f"{i}. {pain}")
     elif snapshot.top_pain_points:
@@ -1840,7 +2103,17 @@ def display_executive_report(snapshot, client_config):
             )
 
     with col2:
-        st.info("💡 Tip: Use browser print (Ctrl+P) to save as PDF")
+        # Export for Deck (ZIP with CSVs)
+        if st.button("📊 Export for Deck (ZIP)"):
+            # Get the DataFrame from session state if available
+            df = st.session_state.get("comments_df")
+            zip_data = create_deck_export_zip(snapshot, df, client_config.primary_brand)
+            st.download_button(
+                label="Download Deck Export ZIP",
+                data=zip_data,
+                file_name=f"{client_config.primary_brand}_deck_export_{snapshot.measured_at.strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+            )
 
 
 def extract_keywords_from_comments(comments_df, primary_brand: str, max_words: int = 100) -> list[dict]:
@@ -2173,7 +2446,7 @@ with st.sidebar:
 
     # Analysis parameters
     days_back = st.slider("Days to analyze", min_value=1, max_value=90, value=30)
-    post_limit = st.slider("Max posts to fetch", min_value=50, max_value=1000, value=500)
+    post_limit = st.slider("Max posts to fetch", min_value=50, max_value=5000, value=500)
 
     # Search mode
     detailed_search = st.checkbox(
@@ -2213,7 +2486,12 @@ if st.session_state.running:
             snapshot = run_analysis(client_config, days_back, post_limit, run_llm, detailed_search, max_keywords)
             st.session_state.snapshot = snapshot
             st.session_state.running = False
-            st.rerun()
+            if snapshot is not None:
+                st.rerun()
+            else:
+                # Analysis returned None (e.g., no comments found)
+                # Don't rerun - the error message is already displayed
+                pass
         except Exception as e:
             import traceback
             error_msg = str(e)

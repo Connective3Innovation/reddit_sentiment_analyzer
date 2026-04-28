@@ -198,7 +198,11 @@ class CompetitorAnalysis(BaseModel):
 
     competitor: str = Field(..., description="Competitor name")
     mention_count: int = Field(..., description="Total mentions found")
-    avg_sentiment: float = Field(..., description="Average sentiment of mentions")
+    avg_sentiment: float = Field(..., description="Average sentiment of mentions (generic)")
+    brand_sentiment_score: float = Field(
+        default=0.0,
+        description="ABSA sentiment TOWARD this competitor (-1 to +1)"
+    )
     positive_mentions: int = Field(default=0, description="Count of positive mentions")
     negative_mentions: int = Field(default=0, description="Count of negative mentions")
     neutral_mentions: int = Field(default=0, description="Count of neutral mentions")
@@ -248,7 +252,11 @@ class CompetitorSnapshot(BaseModel):
     comments_analyzed: int = Field(default=0, description="Total comments analyzed")
 
     # Primary brand metrics
-    primary_sentiment: float = Field(..., description="Primary brand avg sentiment")
+    primary_sentiment: float = Field(..., description="Primary brand avg sentiment (generic)")
+    primary_brand_sentiment: float = Field(
+        default=0.0,
+        description="ABSA sentiment TOWARD primary brand (-1 to +1)"
+    )
     primary_positive_pct: float = Field(default=0, description="% positive comments")
     primary_neutral_pct: float = Field(default=0, description="% neutral comments")
     primary_negative_pct: float = Field(default=0, description="% negative comments")

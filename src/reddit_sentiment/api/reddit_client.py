@@ -27,12 +27,27 @@ class RedditClient:
     # Public API
     # ──────────────────────────────
 
-    def search_posts(self, keyword: str, *, limit: int, days_back: int) -> List[Submission]:
+    def search_posts(
+        self,
+        keyword: str,
+        *,
+        limit: int,
+        days_back: int,
+        subreddits: List[str] | None = None,
+    ) -> List[Submission]:
         """
         Search for posts with a bounded time window and skip mega-threads.
         - Uses Reddit's native time_filter for faster server-side filtering.
         - Applies an explicit UTC cutoff.
         - Optionally skips posts with very large comment counts.
+        - Can target specific subreddits for higher relevance.
+
+        Args:
+            keyword: Search query
+            limit: Max posts to return
+            days_back: How many days back to search
+            subreddits: Optional list of subreddits to search (e.g., ["personalfinance", "CreditCards"]).
+                        If None or empty, searches all of Reddit.
         """
         # Map days_back to a native Reddit time_filter to reduce scan scope
         if days_back <= 1:
@@ -46,7 +61,25 @@ class RedditClient:
         else:
             time_filter = "all"
 
-        submissions = self._client.subreddit("all").search(
+        # Target specific subreddits or search all
+        if subreddits:
+            subreddit_str = "+".join(subreddits)
+            _LOGGER.info(
+                "REDDIT_API: Searching %d subreddits: %s",
+                len(subreddits), ", ".join(subreddits[:5]) + ("..." if len(subreddits) > 5 else "")
+            )
+        else:
+            subreddit_str = "all"
+            _LOGGER.info("REDDIT_API: Searching all of Reddit (no subreddit filter)")
+
+        _LOGGER.info(
+            "REDDIT_API: query='%s', limit=%d, time_filter=%s, days_back=%d",
+            keyword[:50] + "..." if len(keyword) > 50 else keyword,
+            limit, time_filter, days_back
+        )
+
+        start = time.time()
+        submissions = self._client.subreddit(subreddit_str).search(
             query=keyword,
             sort="new",
             time_filter=time_filter,
@@ -59,16 +92,38 @@ class RedditClient:
         max_comments = int(os.getenv("REDDIT_SKIP_LARGE_POSTS", "1200"))
 
         results: List[Submission] = []
+        skipped_old = 0
+        skipped_mega = 0
+        subreddit_counts: dict[str, int] = {}
+
         for s in submissions:
             created_ts = dt.datetime.fromtimestamp(s.created_utc, tz=dt.timezone.utc)
             if created_ts < cutoff_ts:
+                skipped_old += 1
                 continue
             if getattr(s, "num_comments", 0) > max_comments:
+                skipped_mega += 1
                 _LOGGER.debug(
-                    "Skipping mega-thread %s (%s comments)", s.id, s.num_comments
+                    "REDDIT_API: Skipping mega-thread %s (%s comments)", s.id, s.num_comments
                 )
                 continue
+
+            sub_name = str(s.subreddit.display_name)
+            subreddit_counts[sub_name] = subreddit_counts.get(sub_name, 0) + 1
             results.append(s)
+
+        elapsed = time.time() - start
+
+        # Log subreddit distribution
+        top_subs = sorted(subreddit_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_subs_str = ", ".join(f"{k}={v}" for k, v in top_subs)
+
+        _LOGGER.info(
+            "REDDIT_API: Search complete in %.2fs - %d posts found | "
+            "skipped: %d old, %d mega-threads | top subreddits: %s",
+            elapsed, len(results), skipped_old, skipped_mega, top_subs_str
+        )
+
         return results
 
     def fetch_comments(
@@ -85,11 +140,17 @@ class RedditClient:
         """
         submission.comments.replace_more(limit=more_limit)
         comments: List[Comment] = submission.comments.list()
+        original_count = len(comments)
 
         if per_post_limit is not None and len(comments) > per_post_limit:
             # Keep the highest-signal comments
             comments.sort(key=lambda c: getattr(c, "score", 0), reverse=True)
             comments = comments[:per_post_limit]
+            _LOGGER.debug(
+                "REDDIT_API: Post %s - kept %d/%d comments (sorted by score)",
+                submission.id, len(comments), original_count
+            )
+
         return comments
 
     # ──────────────────────────────

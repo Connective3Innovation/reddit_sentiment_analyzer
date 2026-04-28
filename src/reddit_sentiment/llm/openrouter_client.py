@@ -36,8 +36,8 @@ class OpenRouterClient:
         self,
         api_key: Optional[str] = None,
         default_model: Optional[str] = None,
-        max_tokens: int = 2000,
-        timeout: float = 60.0,
+        max_tokens: int = 4000,
+        timeout: float = 90.0,
     ):
         """
         Initialize OpenRouter client.
@@ -110,6 +110,31 @@ class OpenRouterClient:
             logger.error(f"OpenRouter request failed: {type(e).__name__}: {e}")
             raise
 
+    def _repair_json(self, text: str) -> str:
+        """Attempt to repair common JSON issues from LLM output."""
+        import re
+
+        # Fix missing commas between fields (common LLM error)
+        # Pattern: "..." followed by whitespace/newlines then "key":
+        # Without a comma between them
+        text = re.sub(
+            r'("\s*)\n(\s*"[^"]+"\s*:)',
+            r'\1,\n\2',
+            text
+        )
+
+        # Fix missing commas after } or ] followed by "key":
+        text = re.sub(
+            r'(\}|\])\s*\n(\s*"[^"]+"\s*:)',
+            r'\1,\n\2',
+            text
+        )
+
+        # Fix trailing commas before } or ]
+        text = re.sub(r',(\s*[\}\]])', r'\1', text)
+
+        return text
+
     def _parse_json_response(self, response: str) -> dict:
         """Parse JSON from LLM response, handling various markdown formats."""
         text = response.strip()
@@ -139,13 +164,21 @@ class OpenRouterClient:
         import re
         json_match = re.search(r'\{[\s\S]*\}', text)
         if json_match:
+            extracted = json_match.group()
             try:
-                return json.loads(json_match.group())
+                return json.loads(extracted)
             except json.JSONDecodeError:
-                pass
+                # Try repairing the JSON
+                repaired = self._repair_json(extracted)
+                try:
+                    logger.info("JSON repair attempted")
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
 
         # Log the raw response for debugging and raise
         logger.error(f"Failed to parse JSON from LLM response: {text[:500]}...")
+        print(f"Failed to parse JSON from LLM response: {text[:500]}...", flush=True)
         raise json.JSONDecodeError("Could not extract valid JSON from response", text, 0)
 
     def extract_themes(
@@ -495,17 +528,37 @@ class OpenRouterClient:
         """
         from .prompts_v2 import UNIFIED_ANALYSIS_PROMPT, build_stratified_samples
 
+        # Build brand terms for filtering (include common variations)
+        brand_terms = [primary_brand.lower()]
+        if "capital one" in primary_brand.lower():
+            brand_terms.extend(["capitalone", "cap one", "capital one's"])
+
         # Build stratified samples for balanced coverage
-        samples = build_stratified_samples(comments_df)
+        # IMPORTANT: Pass brand terms to filter out non-brand-specific comments
+        samples = build_stratified_samples(
+            comments_df,
+            primary_brand=primary_brand,
+            brand_terms=brand_terms,
+        )
 
         # Calculate metrics from DataFrame
         comments_analyzed = len(comments_df)
         mean_sentiment = float(comments_df["sentiment_score"].mean()) if "sentiment_score" in comments_df.columns else 0.0
 
-        if "sentiment_label" in comments_df.columns:
-            positive_pct = (comments_df["sentiment_label"] == "positive").sum() / max(comments_analyzed, 1) * 100
-            neutral_pct = (comments_df["sentiment_label"] == "neutral").sum() / max(comments_analyzed, 1) * 100
-            negative_pct = (comments_df["sentiment_label"] == "negative").sum() / max(comments_analyzed, 1) * 100
+        if "sentiment_label" in comments_df.columns and comments_analyzed > 0:
+            # Normalize labels and ensure they sum to 100%
+            labels = comments_df["sentiment_label"].fillna("neutral").str.lower()
+            pos_count = (labels == "positive").sum()
+            neu_count = (labels == "neutral").sum()
+            neg_count = (labels == "negative").sum()
+            other_count = comments_analyzed - pos_count - neu_count - neg_count
+
+            # Redistribute "other" labels (mixed, NaN) to neutral
+            neu_count += other_count
+
+            positive_pct = pos_count / comments_analyzed * 100
+            neutral_pct = neu_count / comments_analyzed * 100
+            negative_pct = neg_count / comments_analyzed * 100
         else:
             positive_pct = neutral_pct = negative_pct = 33.3
 
@@ -542,6 +595,10 @@ class OpenRouterClient:
                 ]
             if "content_opportunities" in result and "opportunities" not in result:
                 result["opportunities"] = result["content_opportunities"]
+
+            # Include cluster topics from sampling (for UI display)
+            if "cluster_topics" in samples:
+                result["cluster_topics"] = samples["cluster_topics"]
 
             return result
         except Exception as e:

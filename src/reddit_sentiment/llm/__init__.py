@@ -25,6 +25,7 @@ from .openrouter_client import OpenRouterClient
 from .prompts import PROMPTS
 from .prompts_v2 import UNIFIED_ANALYSIS_PROMPT, build_stratified_samples
 from .cache import get_cached_result, save_to_cache, clear_cache
+from .comment_clustering import CommentClusterer, is_clustering_available
 
 __all__ = [
     "OpenRouterClient",
@@ -34,4 +35,6 @@ __all__ = [
     "get_cached_result",
     "save_to_cache",
     "clear_cache",
+    "CommentClusterer",
+    "is_clustering_available",
 ]
